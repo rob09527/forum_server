@@ -4,106 +4,59 @@ generator client {
 
 datasource db {
   provider = "postgresql"
-  url      = env("DATABASE_URL")
 }
 
 model User {
+  /// 用户 ID，自增主键
   id            Int       @id @default(autoincrement())
+
+  /// 用户名，唯一，3-20 字符，用于展示和 @提及
   username      String    @unique
-  email         String    @unique
-  passwordHash  String
+
+  /// 邮箱，唯一；TG 注册时为空(null)，绑定邮箱后才有值
+  email         String?   @unique
+
+  /// argon2id 密码哈希；TG 注册时为空(null)，绑定邮箱设密码后才有值
+  passwordHash  String?
+
+  /// 头像 URL；TG 注册自动填 TG 头像；邮箱注册默认 null（前端展示默认头像）
   avatar        String?
+
+  /// 个人简介，最长 200 字符
   bio           String?
+
+  /// 用户等级：claw(鸡爪/新手) | leg(鸡腿/中级) | meat(鸡肉/高级)
   level         String    @default("claw")
+
+  /// 鸡腿积分，通过签到/发帖/评论获得
   points        Int       @default(0)
+
+  /// 星辰(特殊积分)，通过精华帖/管理奖励获得
   stars         Int       @default(0)
+
+  /// 发帖总数，冗余字段，避免每次 COUNT 查询
   postCount     Int       @default(0)
+
+  /// 评论总数，冗余字段，避免每次 COUNT 查询
   commentCount  Int       @default(0)
+
+  /// 管理角色：user(普通用户) | mod(版主) | admin(管理员)
   role          String    @default("user")
+
+  /// 第三方登录来源：'telegram' 表示 TG 用户；本站邮箱注册为 null
+  oauthProvider String?
+
+  /// TG 平台返回的用户 ID(纯数字字符串)；本站邮箱注册为 null
+  oauthId       String?   @unique
+
+  /// 邮箱是否已验证（MVP 阶段暂不强制，预留字段）
+  emailVerified Boolean   @default(false)
+
+  /// 注册时间
   createdAt     DateTime  @default(now())
+
+  /// 最后更新时间
   updatedAt     DateTime  @updatedAt
 
-  posts         Post[]
-  comments      Comment[]
-  notifications Notification[]
-  checkins      Checkin[]
-  pointLogs     PointLog[]
-
   @@map("users")
-}
-
-model Post {
-  id           Int       @id @default(autoincrement())
-  title        String
-  content      String    @db.Text
-  slug         String    @unique
-  category     String
-  authorId     Int
-  author       User      @relation(fields: [authorId], references: [id])
-  viewCount    Int       @default(0)
-  likeCount    Int       @default(0)
-  commentCount Int       @default(0)
-  createdAt    DateTime  @default(now())
-  updatedAt    DateTime  @updatedAt
-
-  comments Comment[]
-
-  @@index([category, createdAt(sort: Desc)])
-  @@index([authorId])
-  @@map("posts")
-}
-
-model Comment {
-  id        Int       @id @default(autoincrement())
-  content   String    @db.Text
-  postId    Int
-  post      Post      @relation(fields: [postId], references: [id], onDelete: Cascade)
-  authorId  Int
-  author    User      @relation(fields: [authorId], references: [id])
-  parentId  Int?
-  parent    Comment?  @relation("CommentReplies", fields: [parentId], references: [id])
-  replies   Comment[] @relation("CommentReplies")
-  floor     Int
-  createdAt DateTime  @default(now())
-
-  @@index([postId, createdAt])
-  @@map("comments")
-}
-
-model Notification {
-  id        Int      @id @default(autoincrement())
-  userId    Int
-  type      String
-  title     String
-  content   String
-  isRead    Boolean  @default(false)
-  link      String?
-  createdAt DateTime @default(now())
-
-  @@index([userId, isRead, createdAt(sort: Desc)])
-  @@map("notifications")
-}
-
-model Checkin {
-  id        Int      @id @default(autoincrement())
-  userId    Int      @unique
-  user      User     @relation(fields: [userId], references: [id])
-  streak    Int      @default(1)
-  lastDate  DateTime
-  totalDays Int      @default(1)
-
-  @@map("checkins")
-}
-
-model PointLog {
-  id        Int      @id @default(autoincrement())
-  userId    Int
-  user      User     @relation(fields: [userId], references: [id])
-  amount    Int
-  type      String
-  note      String?
-  createdAt DateTime @default(now())
-
-  @@index([userId, createdAt(sort: Desc)])
-  @@map("point_logs")
 }
