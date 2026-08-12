@@ -1,6 +1,5 @@
 import { randomUUID } from 'crypto'
-import { Redis } from 'ioredis'
-import { config } from '../../config.js'
+import { redis } from '../../lib/redis.js'
 import { RedisKey } from '../../constants/redis-keys.js'
 
 /** Session cookie 名称，auth 模块共用 */
@@ -8,17 +7,6 @@ export const SESSION_COOKIE = 'token'
 
 /** 会话 TTL，单位秒（7 天） */
 export const SESSION_TTL = 604800
-
-/** Redis 客户端实例 */
-const redis = new Redis(config.REDIS_URL, {
-  // 本地开发不设密码，生产通过 .env 注入
-  lazyConnect: true,
-})
-
-// 应用启动时连接 Redis（不阻塞模块加载）
-redis.connect().catch((err: Error) => {
-  console.error('Redis 连接失败:', err.message)
-})
 
 /**
  * 认证 Token 服务。
@@ -51,5 +39,3 @@ export async function verifyToken(token: string): Promise<number | null> {
 export async function revokeToken(token: string): Promise<void> {
   await redis.del(RedisKey.session(token))
 }
-
-export { redis }

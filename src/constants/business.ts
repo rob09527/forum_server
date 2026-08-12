@@ -13,16 +13,54 @@ export const UserLevel = {
 } as const
 export type UserLevelType = (typeof UserLevel)[keyof typeof UserLevel]
 
-/** 帖子板块 */
+/** 帖子板块（前后端统一，由后端常量控制） */
 export const Category = {
-  /** 日常 */
-  DAILY: 'daily',
-  /** 技术 */
-  TECH: 'tech',
-  /** 沙盒（灌水） */
-  SANDBOX: 'sandbox',
+  /** 综合讨论 */
+  GENERAL: 'general',
+  /** 大模型 */
+  LLM: 'llm',
+  /** AI Agent */
+  AGENT: 'agent',
+  /** Prompt 工程 */
+  PROMPT: 'prompt',
+  /** AI 绘画 */
+  ART: 'art',
+  /** 开源模型 */
+  OPENSOURCE: 'opensource',
+  /** AI 工具 */
+  TOOLS: 'tools',
+  /** 论文解读 */
+  PAPER: 'paper',
+  /** 经验分享 */
+  SHARE: 'share',
 } as const
 export type CategoryType = (typeof Category)[keyof typeof Category]
+
+/** 板块中文名映射，用于前端展示和 /api/categories 响应 */
+export const CategoryLabel: Record<CategoryType, string> = {
+  [Category.GENERAL]: '综合讨论',
+  [Category.LLM]: '大模型',
+  [Category.AGENT]: 'AI Agent',
+  [Category.PROMPT]: 'Prompt 工程',
+  [Category.ART]: 'AI 绘画',
+  [Category.OPENSOURCE]: '开源模型',
+  [Category.TOOLS]: 'AI 工具',
+  [Category.PAPER]: '论文解读',
+  [Category.SHARE]: '经验分享',
+}
+
+/** 板块 emoji 图标，用于前端展示和 /api/categories 响应 */
+export const CategoryIcon: Record<CategoryType, string> = {
+  [Category.GENERAL]: '📂',
+  [Category.LLM]: '🤖',
+  [Category.AGENT]: '🔧',
+  [Category.PROMPT]: '✍️',
+  [Category.ART]: '🎨',
+  [Category.OPENSOURCE]: '📦',
+  [Category.TOOLS]: '🛠',
+  [Category.PAPER]: '📄',
+  [Category.SHARE]: '💡',
+}
 
 /** 排序方式 */
 export const SortOrder = {
@@ -69,6 +107,34 @@ export const UserRole = {
   ADMIN: 'admin',
 } as const
 export type UserRoleType = (typeof UserRole)[keyof typeof UserRole]
+
+/** 允许的 DiceBear 头像风格（9.x 版本） */
+export const ALLOWED_AVATAR_STYLES = [
+  'bottts-neutral',
+  'avataaars',
+  'pixel-art',
+  'identicon',
+  'lorelei',
+  'thumbs',
+  'rings',
+  'shapes',
+  'adventurer',
+  'adventurer-neutral',
+  'big-ears',
+  'big-ears-neutral',
+  'big-smile',
+  'croodles',
+  'croodles-neutral',
+  'fun-emoji',
+  'glass',
+  'micah',
+  'miniavs',
+  'notionists',
+  'notionists-neutral',
+  'open-peeps',
+  'personas',
+] as const
+export type AvatarStyleType = (typeof ALLOWED_AVATAR_STYLES)[number]
 
 /** OAuth 第三方来源 */
 export const OAuthProvider = {

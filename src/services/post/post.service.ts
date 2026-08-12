@@ -1,0 +1,492 @@
+import { prisma } from '../../lib/prisma.js'
+import { config } from '../../config.js'
+import { Category, CategoryType, PointType, UserRole } from '../../constants/business.js'
+import {
+  NotFoundError,
+  ForbiddenError,
+  ValidationError,
+} from '../../utils/errors.js'
+import { ErrorCode } from '../../constants/error-codes.js'
+import { redis, RedisKey } from '../../lib/redis.js'
+import { cleanPostImages, extractImagePaths } from '../upload/upload.service.js'
+import { earnPoints } from '../points/points.service.js'
+import type { UserPublic } from '../auth/auth.service.js'
+
+/** 帖子创建请求 */
+export interface CreatePostInput {
+  /** 帖子标题，1-200 字符 */
+  title: string
+  /** Markdown 格式正文，至少 POST_MIN_CONTENT_LENGTH 字符 */
+  content: string
+  /** 所属板块，必须为 Category 枚举值 */
+  category: string
+  /** 标签列表，最多 5 个，每个最长 20 字符 */
+  tags?: string[]
+}
+
+/** 帖子编辑请求，category 不可修改 */
+export interface UpdatePostInput {
+  /** 帖子标题，1-200 字符 */
+  title?: string
+  /** Markdown 格式正文，至少 POST_MIN_CONTENT_LENGTH 字符 */
+  content?: string
+  /** 标签列表，最多 5 个，每个最长 20 字符 */
+  tags?: string[]
+}
+
+/** 帖子列表查询参数 */
+export interface PostListQuery {
+  /** 板块筛选，不传返回全部 */
+  category?: string
+  /** 标签筛选，不传不过滤 */
+  tag?: string
+  /** 排序：latest(最新) | hot(最热)，默认 latest */
+  sort?: 'latest' | 'hot'
+  /** 页码，从 1 开始 */
+  page?: number
+  /** 每页条数，最大 50，默认 20 */
+  pageSize?: number
+}
+
+/** 帖子列表项（不含正文 content） */
+export interface PostListItem {
+  /** 帖子 ID */
+  id: number
+  /** 标题 */
+  title: string
+  /** 所属板块 */
+  category: string
+  /** 标签列表 */
+  tags: string[]
+  /** 作者摘要 */
+  author: {
+    /** 作者 ID */
+    id: number
+    /** 用户名 */
+    username: string
+    /** 头像 URL，null 时前端用默认头像 */
+    avatar: string | null
+    /** 用户等级：claw | leg | meat */
+    level: string
+  }
+  /** 浏览量 */
+  viewCount: number
+  /** 点赞数 */
+  likeCount: number
+  /** 评论数 */
+  commentCount: number
+  /** 是否置顶 */
+  isPinned: boolean
+  /** 最后回复用户，MVP 无评论系统前为 null */
+  lastReplyUser: string | null
+  /** 最后回复时间，MVP 无评论系统前为 null */
+  lastReplyTime: string | null
+  /** 发布时间，ISO 8601 */
+  createdAt: string
+}
+
+/** 帖子详情（含正文 content） */
+export interface PostDetail extends PostListItem {
+  /** Markdown 格式正文 */
+  content: string
+  /** 最后更新时间，ISO 8601（编辑后可展示"最后编辑于"） */
+  updatedAt: string
+}
+
+/** 分页结果 */
+export interface Paginated<T> {
+  /** 当前页数据 */
+  items: T[]
+  /** 当前页码 */
+  page: number
+  /** 每页条数 */
+  pageSize: number
+  /** 总条数 */
+  total: number
+  /** 总页数 */
+  totalPages: number
+}
+
+/** 首页热门帖子 Top N（侧边栏用） */
+export interface HotPost {
+  /** 帖子 ID */
+  id: number
+  /** 标题 */
+  title: string
+  /** 所属板块 */
+  category: string
+  /** 热度分 */
+  heatScore: number
+}
+
+/** 热度计算：点赞×3 + 评论×2 + 浏览/100 */
+function heatScore(post: { likeCount: number; commentCount: number; viewCount: number }): number {
+  return post.likeCount * 3 + post.commentCount * 2 + post.viewCount / 100
+}
+
+/**
+ * 创建帖子。
+ * 校验通过后写入 DB，作者 postCount +1。
+ */
+export async function createPost(input: CreatePostInput, authorId: number): Promise<PostDetail> {
+  const { title, content, category, tags = [] } = input
+
+  // 标题校验
+  const trimmedTitle = title?.trim() ?? ''
+  if (trimmedTitle.length < 1 || trimmedTitle.length > 200) {
+    throw new ValidationError('标题需要 1-200 个字符', ErrorCode.POST_TITLE_INVALID)
+  }
+
+  // 正文长度校验（防止水帖）
+  const trimmedContent = content?.trim() ?? ''
+  if (trimmedContent.length < config.POST_MIN_CONTENT_LENGTH) {
+    throw new ValidationError(`正文至少 ${config.POST_MIN_CONTENT_LENGTH} 个字符`, ErrorCode.POST_CONTENT_TOO_SHORT)
+  }
+
+  // 板块合法性校验
+  if (!Object.values(Category).includes(category as CategoryType)) {
+    throw new ValidationError('无效的板块', ErrorCode.POST_CATEGORY_INVALID)
+  }
+
+  // 标签校验：最多 5 个，每个最长 20 字符
+  const cleanTags = Array.isArray(tags)
+    ? tags.map((t) => t.trim()).filter(Boolean)
+    : []
+  if (cleanTags.length > 5) {
+    throw new ValidationError('最多 5 个标签', ErrorCode.POST_TAGS_INVALID)
+  }
+  if (cleanTags.some((t) => t.length > 20)) {
+    throw new ValidationError('每个标签最长 20 个字符', ErrorCode.POST_TAGS_INVALID)
+  }
+
+  const post = await prisma.post.create({
+    data: {
+      title: trimmedTitle,
+      content: trimmedContent,
+      category,
+      tags: cleanTags,
+      authorId,
+    },
+    include: {
+      author: {
+        select: { id: true, username: true, avatar: true, level: true },
+      },
+    },
+  })
+
+  // 冗余计数：作者发帖数 +1（发帖是低频操作，直接 update）
+  await prisma.user.update({
+    where: { id: authorId },
+    data: { postCount: { increment: 1 } },
+  })
+
+  // [R1] 发帖 +10 鸡腿，当日最多 3 帖有分，超限静默跳过
+  const result = await earnPoints(authorId, PointType.POST, { refId: post.id })
+
+  const detail = toDetail(post)
+  // 升级即时生效：返回给前端的作者等级覆盖为升级后的值 [R22]
+  if (result.earned > 0 && result.level) {
+    detail.author.level = result.level
+  }
+  return detail
+}
+
+/**
+ * 查询单个帖子详情。
+ * 同时异步更新浏览计数（Redis SET 去重，同一用户 24h 内只计一次）。
+ * viewerId 为 null 表示未登录用户，不计数（防刷）。
+ */
+export async function getPostById(id: number, viewerId?: number): Promise<PostDetail> {
+  const post = await prisma.post.findUnique({
+    where: { id },
+    include: {
+      author: {
+        select: { id: true, username: true, avatar: true, level: true },
+      },
+    },
+  })
+
+  if (!post) {
+    throw new NotFoundError('帖子', ErrorCode.POST_NOT_FOUND)
+  }
+
+  // 异步浏览计数：未登录（viewerId 为 null）不计数
+  if (viewerId) {
+    recordViewCount(post.id, viewerId).catch((err) => {
+      // 浏览计数是增强功能，失败不影响响应
+      console.error('[post] view count record failed:', err)
+    })
+  }
+
+  return toDetail(post)
+}
+
+/**
+ * 浏览计数（Redis 去重）。
+ * SADD 返回 1 → 新用户，INCR DB viewCount；返回 0 → 已看过，忽略。
+ */
+async function recordViewCount(postId: number, userId: number): Promise<void> {
+  const viewersKey = RedisKey.postViewers(postId)
+  const added = await redis.sadd(viewersKey, String(userId))
+
+  if (added === 1) {
+    // 首次浏览，设置 TTL 后定时回写 DB
+    await redis.expire(viewersKey, RedisKey.postViewerTtl)
+    await prisma.post.update({
+      where: { id: postId },
+      data: { viewCount: { increment: 1 } },
+    })
+  }
+}
+
+/**
+ * 帖子列表查询。
+ * latest：置顶优先 + 发布时间倒序
+ * hot：最近 7 天 + 热度分倒序
+ */
+export async function listPosts(query: PostListQuery): Promise<Paginated<PostListItem>> {
+  // 页码/页大小校验：NaN、小数、负数直接抛校验错误（避免 skip: NaN 导致 500）
+  const page = Number(query.page ?? 1)
+  const pageSize = Number(query.pageSize ?? 20)
+  if (!Number.isInteger(page) || page < 1) {
+    throw new ValidationError('页码必须是正整数', ErrorCode.VALIDATION_ERROR)
+  }
+  if (!Number.isInteger(pageSize) || pageSize < 1) {
+    throw new ValidationError('每页条数必须是正整数', ErrorCode.VALIDATION_ERROR)
+  }
+  const safePageSize = Math.min(50, pageSize)
+  const sort = query.sort ?? 'latest'
+  const category = query.category
+  const tag = query.tag
+
+  // 板块筛选（传了但无效 → 抛错；不传 → 全部）
+  if (category && !Object.values(Category).includes(category as CategoryType)) {
+    throw new ValidationError('无效的板块', ErrorCode.POST_CATEGORY_INVALID)
+  }
+
+  const where = {
+    ...(category ? { category } : {}),
+    // 标签筛选：TEXT[] 数组包含该标签
+    ...(tag ? { tags: { has: tag } } : {}),
+  }
+
+  // hot：最近 7 天 + 按热度分（heatScore）降序，与侧边栏热榜同一算法，不设 isHot 标记
+  // MVP 规模全量拉取后内存排序，数据量大后改 SQL 排序
+  if (sort === 'hot') {
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 3600 * 1000)
+    const hotWhere = { ...where, createdAt: { gte: sevenDaysAgo } }
+    const [total, posts] = await Promise.all([
+      prisma.post.count({ where: hotWhere }),
+      prisma.post.findMany({
+        where: hotWhere,
+        include: {
+          author: {
+            select: { id: true, username: true, avatar: true, level: true },
+          },
+        },
+      }),
+    ])
+
+    const sorted = posts.sort((a, b) => {
+      if (a.isPinned !== b.isPinned) return a.isPinned ? -1 : 1
+      return heatScore(b) - heatScore(a)
+    })
+
+    return {
+      items: sorted.slice((page - 1) * safePageSize, page * safePageSize).map((p) => toListItem(p)),
+      page,
+      pageSize: safePageSize,
+      total,
+      totalPages: Math.ceil(total / safePageSize),
+    }
+  }
+
+  // latest：置顶优先 + 时间倒序
+  const [total, posts] = await Promise.all([
+    prisma.post.count({ where }),
+    prisma.post.findMany({
+      where,
+      include: {
+        author: {
+          select: { id: true, username: true, avatar: true, level: true },
+        },
+      },
+      orderBy: [{ isPinned: 'desc' }, { createdAt: 'desc' }],
+      skip: (page - 1) * safePageSize,
+      take: safePageSize,
+    }),
+  ])
+
+  return {
+    items: posts.map((p) => toListItem(p)),
+    page,
+    pageSize: safePageSize,
+    total,
+    totalPages: Math.ceil(total / safePageSize),
+  }
+}
+
+/**
+ * 编辑帖子。
+ * 仅作者本人可编辑，板块不可修改。
+ */
+export async function updatePost(id: number, input: UpdatePostInput, userId: number): Promise<PostDetail> {
+  const existing = await prisma.post.findUnique({ where: { id } })
+  if (!existing) {
+    throw new NotFoundError('帖子', ErrorCode.POST_NOT_FOUND)
+  }
+  if (existing.authorId !== userId) {
+    throw new ForbiddenError('只能编辑自己的帖子', ErrorCode.POST_NOT_OWNER)
+  }
+
+  const data: { title?: string; content?: string; tags?: string[] } = {}
+
+  // 标题
+  if (input.title !== undefined) {
+    const title = input.title.trim()
+    if (title.length < 1 || title.length > 200) {
+      throw new ValidationError('标题需要 1-200 个字符', ErrorCode.POST_TITLE_INVALID)
+    }
+    data.title = title
+  }
+
+  // 正文
+  if (input.content !== undefined) {
+    const content = input.content.trim()
+    if (content.length < config.POST_MIN_CONTENT_LENGTH) {
+      throw new ValidationError(`正文至少 ${config.POST_MIN_CONTENT_LENGTH} 个字符`, ErrorCode.POST_CONTENT_TOO_SHORT)
+    }
+    data.content = content
+  }
+
+  // 标签
+  if (input.tags !== undefined) {
+    const tags = input.tags.map((t) => t.trim()).filter(Boolean)
+    if (tags.length > 5) {
+      throw new ValidationError('最多 5 个标签', ErrorCode.POST_TAGS_INVALID)
+    }
+    if (tags.some((t) => t.length > 20)) {
+      throw new ValidationError('每个标签最长 20 个字符', ErrorCode.POST_TAGS_INVALID)
+    }
+    data.tags = tags
+  }
+
+  const post = await prisma.post.update({
+    where: { id },
+    data,
+    include: {
+      author: {
+        select: { id: true, username: true, avatar: true, level: true },
+      },
+    },
+  })
+
+  return toDetail(post)
+}
+
+/**
+ * 删除帖子（硬删除）。
+ * 仅作者本人或 admin 可删。级联删除评论/点赞，并清理 content 引用的本地图片。
+ */
+export async function deletePost(id: number, user: UserPublic): Promise<void> {
+  const existing = await prisma.post.findUnique({ where: { id } })
+  if (!existing) {
+    throw new NotFoundError('帖子', ErrorCode.POST_NOT_FOUND)
+  }
+  if (existing.authorId !== user.id && user.role !== UserRole.ADMIN) {
+    throw new ForbiddenError('只能删除自己的帖子', ErrorCode.POST_NOT_OWNER)
+  }
+
+  // 提取正文中引用的本地图片路径（相对路径 /uploads/...）
+  const imagePaths = extractImagePaths(existing.content)
+
+  // 级联删除：comments 的 onDelete Cascade 会自动清子回复和 comment_likes，
+  // post_likes 通过 post 的 onDelete Cascade 自动清。
+  await prisma.post.delete({ where: { id } })
+
+  // 作者发帖数 -1
+  await prisma.user.update({
+    where: { id: existing.authorId },
+    data: { postCount: { decrement: 1 } },
+  })
+
+  // 清理引用的本地图片（unlink 失败只记日志，不影响主流程）
+  await cleanPostImages(existing.authorId, imagePaths)
+}
+
+/** 首页热门帖子 Top N（侧边栏用，不传 category 或传全部） */
+export async function getHotPosts(limit = 10): Promise<HotPost[]> {
+  // 最近 7 天，按热度分（heatScore）降序取前 N，与热门列表同一算法
+  const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 3600 * 1000)
+  const posts = await prisma.post.findMany({
+    where: { createdAt: { gte: sevenDaysAgo } },
+    select: { id: true, title: true, category: true, likeCount: true, commentCount: true, viewCount: true },
+  })
+
+  return posts
+    .sort((a, b) => heatScore(b) - heatScore(a))
+    .slice(0, limit)
+    .map((p) => ({
+      id: p.id,
+      title: p.title,
+      category: p.category,
+      heatScore: heatScore(p),
+    }))
+}
+
+/** 将 Prisma Post（含 author）转为列表项 */
+function toListItem(post: {
+  id: number
+  title: string
+  category: string
+  tags: string[]
+  author: { id: number; username: string; avatar: string | null; level: string }
+  viewCount: number
+  likeCount: number
+  commentCount: number
+  isPinned: boolean
+  createdAt: Date
+  updatedAt: Date
+}): PostListItem {
+  return {
+    id: post.id,
+    title: post.title,
+    category: post.category,
+    tags: post.tags,
+    author: {
+      id: post.author.id,
+      username: post.author.username,
+      avatar: post.author.avatar,
+      level: post.author.level,
+    },
+    viewCount: post.viewCount,
+    likeCount: post.likeCount,
+    commentCount: post.commentCount,
+    isPinned: post.isPinned,
+    lastReplyUser: null,
+    lastReplyTime: null,
+    createdAt: post.createdAt.toISOString(),
+  }
+}
+
+/** 将 Prisma Post（含 content + author）转为详情 */
+function toDetail(post: {
+  id: number
+  title: string
+  content: string
+  category: string
+  tags: string[]
+  author: { id: number; username: string; avatar: string | null; level: string }
+  viewCount: number
+  likeCount: number
+  commentCount: number
+  isPinned: boolean
+  createdAt: Date
+  updatedAt: Date
+}): PostDetail {
+  return {
+    ...toListItem(post),
+    content: post.content,
+    updatedAt: post.updatedAt.toISOString(),
+  }
+}

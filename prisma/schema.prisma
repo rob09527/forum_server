@@ -52,11 +52,224 @@ model User {
   /// 邮箱是否已验证（MVP 阶段暂不强制，预留字段）
   emailVerified Boolean   @default(false)
 
+  /// 累计上传图片总字节数，上传前校验不超过 UPLOAD_MAX_USER_TOTAL_SIZE
+  uploadSize    Int       @default(0)
+
+  /// 累计获得鸡腿（只增不减），等级升级依据 [R20]
+  totalPointsEarned Int   @default(0)
+
+  /// 连续签到天数，断签归零 [R13]
+  checkinStreak Int       @default(0)
+
+  /// 累计签到天数，永不归零 [R13]
+  checkinTotalDays Int    @default(0)
+
+  /// 上次签到时间，用于判断是否断签 [R13]
+  lastCheckinAt DateTime?
+
+  /// 积分流水记录
+  pointLogs     PointLog[]
+
   /// 注册时间
   createdAt     DateTime  @default(now())
 
   /// 最后更新时间
   updatedAt     DateTime  @updatedAt
 
+  /// 用户发布的帖子
+  posts         Post[]
+
+  /// 用户发布的评论
+  comments      Comment[]
+
+  /// 用户的帖子点赞记录
+  postLikes     PostLike[]
+
+  /// 用户的评论点赞记录
+  commentLikes  CommentLike[]
+
   @@map("users")
+}
+
+/// 论坛帖子
+model Post {
+  /// 帖子 ID，自增主键
+  id           Int       @id @default(autoincrement())
+
+  /// 帖子标题，1-200 字符
+  title        String
+
+  /// Markdown 格式正文
+  content      String    @db.Text
+
+  /// 所属板块，对应 Category 枚举值：general | llm | agent | prompt | art | opensource | tools | paper | share
+  category     String
+
+  /// 标签列表，最多 5 个，每个最长 20 字符，用 PG 数组存储 + GIN 索引
+  tags         String[]
+
+  /// 作者 ID
+  authorId     Int
+
+  /// 作者
+  author       User      @relation(fields: [authorId], references: [id])
+
+  /// 浏览量（Redis 去重计数后定时回写）
+  viewCount    Int       @default(0)
+
+  /// 点赞数（冗余字段，点赞时更新）
+  likeCount    Int       @default(0)
+
+  /// 评论数（冗余字段，发评论时更新）
+  commentCount Int       @default(0)
+
+  /// 是否置顶，置顶帖列表优先展示（admin 模块后续提供置顶 API）
+  isPinned     Boolean   @default(false)
+
+  /// 发布时间
+  createdAt    DateTime  @default(now())
+
+  /// 最后更新时间（编辑后自动更新，前端展示"最后编辑于"）
+  updatedAt    DateTime  @updatedAt
+
+  /// 帖子下的评论
+  comments     Comment[]
+
+  /// 帖子的点赞记录
+  likes        PostLike[]
+
+  @@index([category, createdAt(sort: Desc)])
+  @@index([authorId])
+  @@index([createdAt])
+  @@index([tags], type: Gin) // 标签筛选 GIN 索引，tags: { has: tag } 查询依赖
+  @@map("posts")
+}
+
+/// 帖子评论（支持楼中楼回复）
+model Comment {
+  /// 评论 ID，自增主键
+  id        Int       @id @default(autoincrement())
+
+  /// Markdown 格式评论内容
+  content   String    @db.Text
+
+  /// 所属帖子 ID，帖子删除时级联删除评论
+  postId    Int
+
+  /// 所属帖子
+  post      Post      @relation(fields: [postId], references: [id], onDelete: Cascade)
+
+  /// 评论者 ID
+  authorId  Int
+
+  /// 评论者
+  author    User      @relation(fields: [authorId], references: [id])
+
+  /// 回复目标评论 ID，null 表示顶层楼层，有值表示楼中楼回复
+  parentId  Int?
+
+  /// 回复的目标评论（删除父评论时级联删除其所有楼中楼回复）
+  parent    Comment?  @relation("CommentReplies", fields: [parentId], references: [id], onDelete: Cascade)
+
+  /// 该评论下的楼中楼回复
+  replies   Comment[] @relation("CommentReplies")
+
+  /// 楼层号（同一帖子内唯一），顶层评论才分配，楼中楼回复为 null
+  floor     Int?
+
+  /// 点赞数（冗余字段，点赞时更新）
+  likeCount Int       @default(0)
+
+  /// 评论时间
+  createdAt DateTime  @default(now())
+
+  /// 评论的点赞记录
+  likes     CommentLike[]
+
+  @@unique([postId, floor])
+  @@index([postId, createdAt])
+  @@index([authorId])
+  @@map("comments")
+}
+
+/// 帖子点赞记录
+model PostLike {
+  /// 点赞记录 ID
+  id        Int      @id @default(autoincrement())
+
+  /// 被点赞的帖子 ID，帖子删除时级联删除
+  postId    Int
+
+  /// 被点赞的帖子
+  post      Post     @relation(fields: [postId], references: [id], onDelete: Cascade)
+
+  /// 点赞用户 ID
+  userId    Int
+
+  /// 点赞用户
+  user      User     @relation(fields: [userId], references: [id])
+
+  /// 点赞时间
+  createdAt DateTime @default(now())
+
+  /// 同一用户对同一帖子只能点一次赞
+  @@unique([postId, userId])
+  @@index([userId])
+  @@map("post_likes")
+}
+
+/// 评论点赞记录
+model CommentLike {
+  /// 点赞记录 ID
+  id        Int      @id @default(autoincrement())
+
+  /// 被点赞的评论 ID，评论删除时级联删除
+  commentId Int
+
+  /// 被点赞的评论
+  comment   Comment  @relation(fields: [commentId], references: [id], onDelete: Cascade)
+
+  /// 点赞用户 ID
+  userId    Int
+
+  /// 点赞用户
+  user      User     @relation(fields: [userId], references: [id])
+
+  /// 点赞时间
+  createdAt DateTime @default(now())
+
+  /// 同一用户对同一评论只能点一次赞
+  @@unique([commentId, userId])
+  @@index([userId])
+  @@map("comment_likes")
+}
+
+/// 积分流水记录
+model PointLog {
+  /// 流水 ID，自增主键
+  id           Int      @id @default(autoincrement())
+
+  /// 用户 ID
+  userId       Int
+
+  /// 用户
+  user         User     @relation(fields: [userId], references: [id])
+
+  /// 积分来源：checkin(签到) | post(发帖) | comment(评论) | liked(被点赞)
+  type         String
+
+  /// 变动值（正数，MVP 无扣分场景）[R41]
+  delta        Int
+
+  /// 变动后的鸡腿余额，用于流水对账 [R42]
+  balanceAfter Int
+
+  /// 关联的帖子/评论 ID，用于溯源，无关联为 null
+  refId        Int?
+
+  /// 变动时间
+  createdAt    DateTime @default(now())
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("point_logs")
 }

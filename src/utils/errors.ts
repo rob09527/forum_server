@@ -15,24 +15,24 @@ export class AppError extends Error {
   }
 }
 
-/** 资源不存在 */
+/** 资源不存在，code 可选，默认通用 NOT_FOUND */
 export class NotFoundError extends AppError {
-  constructor(resource: string) {
-    super(`${resource}不存在`, 404, ErrorCode.NOT_FOUND)
+  constructor(resource: string, code: string = ErrorCode.NOT_FOUND) {
+    super(`${resource}不存在`, 404, code)
   }
 }
 
-/** 无权限 */
+/** 无权限，code 可选，默认通用 FORBIDDEN */
 export class ForbiddenError extends AppError {
-  constructor(message = '无权限') {
-    super(message, 403, ErrorCode.FORBIDDEN)
+  constructor(message = '无权限', code: string = ErrorCode.FORBIDDEN) {
+    super(message, 403, code)
   }
 }
 
-/** 参数校验失败 */
+/** 参数校验失败，code 可选，默认通用 VALIDATION_ERROR */
 export class ValidationError extends AppError {
-  constructor(message: string) {
-    super(message, 400, ErrorCode.VALIDATION_ERROR)
+  constructor(message: string, code: string = ErrorCode.VALIDATION_ERROR) {
+    super(message, 400, code)
   }
 }
 

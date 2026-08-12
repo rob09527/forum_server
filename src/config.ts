@@ -24,6 +24,18 @@ const envSchema = z.object({
   MEILI_MASTER_KEY: z.string().default(''),
   /** Telegram Bot Token，用于 TG Login Widget 验签 */
   TELEGRAM_BOT_TOKEN: z.string().default(''),
+
+  /** 单文件最大字节数，默认 10MB */
+  UPLOAD_MAX_FILE_SIZE: z.coerce.number().int().positive().default(10485760),
+  /** 单用户累计上传总字节数上限，默认 50MB */
+  UPLOAD_MAX_USER_TOTAL_SIZE: z.coerce.number().int().positive().default(52428800),
+  /** 单用户每分钟最大上传次数，默认 20 */
+  UPLOAD_MAX_UPLOADS_PER_MINUTE: z.coerce.number().int().positive().default(20),
+  /** 图片基础 URL，本地用当前 IP:3001，生产换域名；DB 只存相对路径，API 返回时拼接 */
+  UPLOAD_BASE_URL: z.string().min(1).default('http://localhost:3001'),
+
+  /** 帖子正文最少字符数，防止水帖，默认 10 */
+  POST_MIN_CONTENT_LENGTH: z.coerce.number().int().positive().default(10),
 })
 
 const parsed = envSchema.safeParse(process.env)

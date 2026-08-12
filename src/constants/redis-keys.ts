@@ -23,6 +23,10 @@ export const RedisKey = {
   postViewCount: (id: number) => `post:${id}:view_count` as const,
   /** 帖子点赞用户集合（Set） */
   likedUsers: (postId: number) => `post:${postId}:liked_users` as const,
+  /** 已浏览帖子的用户集合（Set），用于 24h 内浏览去重，key 中的 userId 为 0 表示未登录 */
+  postViewers: (postId: number) => `post:${postId}:viewers` as const,
+  /** 帖子浏览去重的 TTL，单位秒（24 小时） */
+  postViewerTtl: 86400,
 
   // ── 列表缓存 ──
   /** 热门帖子列表 */
@@ -30,11 +34,17 @@ export const RedisKey = {
   /** 板块帖子列表 */
   boardPosts: (board: string) => `posts:board:${board}` as const,
 
+  // ── 上传限流 ──
+  /** 用户每分钟上传次数计数，key 中的 minute 格式为 YYYYMMDDHHMM */
+  uploadRate: (userId: number, minute: string) => `upload_rate:${userId}:${minute}` as const,
+
   // ── 签到 ──
-  /** 每日签到用户集合（Bitmap），key 中的 date 格式为 YYYY-MM-DD */
-  checkinBitmap: (date: string) => `checkin:${date}:users` as const,
-  /** 用户连续签到天数 */
-  checkinStreak: (userId: number) => `checkin:${userId}:streak` as const,
+  /** 某日签到用户集合（SET），key 中的 date 格式为 YYYY-MM-DD，用于签到日历查询 */
+  checkinDate: (date: string) => `checkin:${date}:users` as const,
+
+  // ── 积分 ──
+  /** 用户当日某类积分发放累计计数，key 中 type 为 post|comment，date 为 YYYY-MM-DD [R1/R2] */
+  pointDaily: (type: string, userId: number, date: string) => `point_daily:${type}:${userId}:${date}` as const,
 
   // ── 限流 ──
   /** API 限流计数 */
