@@ -212,6 +212,9 @@ model PostLike {
   /// 点赞时间
   createdAt DateTime @default(now())
 
+  /// 是否仍处于点赞状态；取消点赞置 false 保留记录，重赞时不重复发分
+  active    Boolean  @default(true)
+
   /// 同一用户对同一帖子只能点一次赞
   @@unique([postId, userId])
   @@index([userId])
@@ -237,6 +240,9 @@ model CommentLike {
 
   /// 点赞时间
   createdAt DateTime @default(now())
+
+  /// 是否仍处于点赞状态；取消点赞置 false 保留记录，重赞时不重复发分
+  active    Boolean  @default(true)
 
   /// 同一用户对同一评论只能点一次赞
   @@unique([commentId, userId])

@@ -2,6 +2,8 @@ import type { FastifyInstance, FastifyRequest } from 'fastify'
 import { sendSuccess } from '../utils/response.js'
 import { authenticate, optionalAuth } from '../middleware/auth.middleware.js'
 import { ValidationError } from '../utils/errors.js'
+import { parseId } from '../utils/parse.js'
+import { Category } from '../constants/business.js'
 import {
   createPost,
   getPostById,
@@ -27,7 +29,17 @@ function requireUser(request: FastifyRequest): UserPublic {
  */
 export async function postRoutes(fastify: FastifyInstance): Promise<void> {
   /** GET /api/posts — 帖子列表（可选登录，登录后可用于判断点赞态） */
-  fastify.get('/api/posts', { preHandler: [optionalAuth] }, async (request, reply) => {
+  fastify.get('/api/posts', {
+    preHandler: [optionalAuth],
+    schema: {
+      querystring: {
+        type: 'object',
+        properties: {
+          sort: { type: 'string', enum: ['latest', 'hot'] },
+        },
+      },
+    },
+  }, async (request, reply) => {
     const query = request.query as {
       category?: string
       /** 按标签过滤（TEXT[] 包含该标签） */
@@ -57,12 +69,26 @@ export async function postRoutes(fastify: FastifyInstance): Promise<void> {
   /** GET /api/posts/:id — 帖子详情（可选登录，登录用户计入浏览量去重） */
   fastify.get('/api/posts/:id', { preHandler: [optionalAuth] }, async (request, reply) => {
     const { id } = request.params as { id: string }
-    const post = await getPostById(Number(id), request.user?.id)
+    const post = await getPostById(parseId(id), request.user?.id)
     sendSuccess(reply, post)
   })
 
   /** POST /api/posts — 发帖 */
-  fastify.post('/api/posts', { preHandler: [authenticate] }, async (request, reply) => {
+  fastify.post('/api/posts', {
+    preHandler: [authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        required: ['title', 'content', 'category'],
+        properties: {
+          title: { type: 'string', minLength: 1, maxLength: 200 },
+          content: { type: 'string', minLength: 1 },
+          category: { type: 'string', enum: Object.values(Category) },
+          tags: { type: 'array', maxItems: 5, items: { type: 'string', maxLength: 20 } },
+        },
+      },
+    },
+  }, async (request, reply) => {
     const user = requireUser(request)
     const body = request.body as {
       title: string
@@ -85,12 +111,24 @@ export async function postRoutes(fastify: FastifyInstance): Promise<void> {
   })
 
   /** PATCH /api/posts/:id — 编辑帖子（仅作者） */
-  fastify.patch('/api/posts/:id', { preHandler: [authenticate] }, async (request, reply) => {
+  fastify.patch('/api/posts/:id', {
+    preHandler: [authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        properties: {
+          title: { type: 'string', minLength: 1, maxLength: 200 },
+          content: { type: 'string', minLength: 1 },
+          tags: { type: 'array', maxItems: 5, items: { type: 'string', maxLength: 20 } },
+        },
+      },
+    },
+  }, async (request, reply) => {
     const user = requireUser(request)
     const { id } = request.params as { id: string }
     const body = request.body as { title?: string; content?: string; tags?: string[] }
 
-    const post = await updatePost(Number(id), body, user.id)
+    const post = await updatePost(parseId(id), body, user.id)
     sendSuccess(reply, post)
   })
 
@@ -99,7 +137,7 @@ export async function postRoutes(fastify: FastifyInstance): Promise<void> {
     const user = requireUser(request)
     const { id } = request.params as { id: string }
 
-    await deletePost(Number(id), user)
+    await deletePost(parseId(id), user)
     sendSuccess(reply, null)
   })
 
@@ -108,7 +146,7 @@ export async function postRoutes(fastify: FastifyInstance): Promise<void> {
     const user = requireUser(request)
     const { id } = request.params as { id: string }
 
-    const likeCount = await likePost(Number(id), user.id)
+    const likeCount = await likePost(parseId(id), user.id)
     sendSuccess(reply, { likeCount })
   })
 
@@ -117,7 +155,7 @@ export async function postRoutes(fastify: FastifyInstance): Promise<void> {
     const user = requireUser(request)
     const { id } = request.params as { id: string }
 
-    const likeCount = await unlikePost(Number(id), user.id)
+    const likeCount = await unlikePost(parseId(id), user.id)
     sendSuccess(reply, { likeCount })
   })
 }

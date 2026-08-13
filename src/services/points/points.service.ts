@@ -1,3 +1,4 @@
+import type { Prisma } from '@prisma/client'
 import { prisma } from '../../lib/prisma.js'
 import { redis } from '../../lib/redis.js'
 import { RedisKey } from '../../constants/redis-keys.js'
@@ -65,11 +66,14 @@ export async function earnPoints(
   userId: number,
   type: PointTypeValue,
   options: EarnPointsOptions = {},
+  tx?: Prisma.TransactionClient,
 ): Promise<EarnResult> {
   const rule = POINT_RULES[type]
   const delta = options.delta ?? rule.delta
 
-  // [R1][R2] 当日次数上限拦截：只对可主动刷的行为设限（发帖/评论）
+  // [R1][R2] 当日次数上限拦截：只对可主动刷的行为设限（发帖/评论）。
+  // Redis 计数独立于 DB 事务（无法跨存储原子），若后续 DB 事务回滚会多占一个当日名额，
+  // 属可接受的软限流误差，不引入额外复杂度。
   if (rule.dailyTimes) {
     const key = RedisKey.pointDaily(type, userId, formatDateKey(new Date()))
     const times = await redis.incr(key)
@@ -79,28 +83,35 @@ export async function earnPoints(
     }
   }
 
-  // [R40] 同步增加余额与累计
-  const updated = await prisma.user.update({
-    where: { id: userId },
-    data: {
-      points: { increment: delta },
-      totalPointsEarned: { increment: delta },
-    },
-    select: { points: true, totalPointsEarned: true, level: true },
-  })
+  // 「加分 → 升级 → 写流水」三段写必须原子：要么全成功，要么全回滚，
+  // 避免出现「鸡腿加了但没流水」或「流水写了但等级没升」的对账缺口。
+  // 传入 tx 时复用调用方事务；否则自建一个事务。
+  const apply = async (db: Prisma.TransactionClient): Promise<EarnResult> => {
+    // [R40] 同步增加余额与累计
+    const updated = await db.user.update({
+      where: { id: userId },
+      data: {
+        points: { increment: delta },
+        totalPointsEarned: { increment: delta },
+      },
+      select: { points: true, totalPointsEarned: true, level: true },
+    })
 
-  // [R22] 升级：按累计值判定，只升不降（永不降级）
-  const newLevel = levelForTotal(updated.totalPointsEarned)
-  if (newLevel !== updated.level) {
-    await prisma.user.update({ where: { id: userId }, data: { level: newLevel } })
+    // [R22] 升级：按累计值判定，只升不降（永不降级）
+    const newLevel = levelForTotal(updated.totalPointsEarned)
+    if (newLevel !== updated.level) {
+      await db.user.update({ where: { id: userId }, data: { level: newLevel } })
+    }
+
+    // [R41] 写流水，[R42] 记录加分后的余额用于对账
+    await db.pointLog.create({
+      data: { userId, type, delta, balanceAfter: updated.points, refId: options.refId },
+    })
+
+    return { earned: delta, level: newLevel }
   }
 
-  // [R41] 写流水，[R42] 记录加分后的余额用于对账
-  await prisma.pointLog.create({
-    data: { userId, type, delta, balanceAfter: updated.points, refId: options.refId },
-  })
-
-  return { earned: delta, level: newLevel }
+  return tx ? apply(tx) : prisma.$transaction(apply)
 }
 
 /** 按累计鸡腿判定等级 [R21]，levelForTotal 独立导出供注册等场景直接算等级 */

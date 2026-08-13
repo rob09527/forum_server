@@ -159,36 +159,39 @@ export async function createPost(input: CreatePostInput, authorId: number): Prom
     throw new ValidationError('每个标签最长 20 个字符', ErrorCode.POST_TAGS_INVALID)
   }
 
-  const post = await prisma.post.create({
-    data: {
-      title: trimmedTitle,
-      content: trimmedContent,
-      category,
-      tags: cleanTags,
-      authorId,
-    },
-    include: {
-      author: {
-        select: { id: true, username: true, avatar: true, level: true },
+  // 「建帖 → 发帖数 +1 → 发分」原子化，避免帖子存在但计数/积分没落库的脏数据
+  return prisma.$transaction(async (tx) => {
+    const post = await tx.post.create({
+      data: {
+        title: trimmedTitle,
+        content: trimmedContent,
+        category,
+        tags: cleanTags,
+        authorId,
       },
-    },
+      include: {
+        author: {
+          select: { id: true, username: true, avatar: true, level: true },
+        },
+      },
+    })
+
+    // 冗余计数：作者发帖数 +1（发帖是低频操作，直接 update）
+    await tx.user.update({
+      where: { id: authorId },
+      data: { postCount: { increment: 1 } },
+    })
+
+    // [R1] 发帖 +10 鸡腿，当日最多 3 帖有分，超限静默跳过
+    const result = await earnPoints(authorId, PointType.POST, { refId: post.id }, tx)
+
+    const detail = toDetail(post)
+    // 升级即时生效：返回给前端的作者等级覆盖为升级后的值 [R22]
+    if (result.earned > 0 && result.level) {
+      detail.author.level = result.level
+    }
+    return detail
   })
-
-  // 冗余计数：作者发帖数 +1（发帖是低频操作，直接 update）
-  await prisma.user.update({
-    where: { id: authorId },
-    data: { postCount: { increment: 1 } },
-  })
-
-  // [R1] 发帖 +10 鸡腿，当日最多 3 帖有分，超限静默跳过
-  const result = await earnPoints(authorId, PointType.POST, { refId: post.id })
-
-  const detail = toDetail(post)
-  // 升级即时生效：返回给前端的作者等级覆盖为升级后的值 [R22]
-  if (result.earned > 0 && result.level) {
-    detail.author.level = result.level
-  }
-  return detail
 }
 
 /**
@@ -402,12 +405,13 @@ export async function deletePost(id: number, user: UserPublic): Promise<void> {
 
   // 级联删除：comments 的 onDelete Cascade 会自动清子回复和 comment_likes，
   // post_likes 通过 post 的 onDelete Cascade 自动清。
-  await prisma.post.delete({ where: { id } })
-
-  // 作者发帖数 -1
-  await prisma.user.update({
-    where: { id: existing.authorId },
-    data: { postCount: { decrement: 1 } },
+  // 删除帖子 + 作者发帖数 -1 同事务，避免「删了但计数没减」。
+  await prisma.$transaction(async (tx) => {
+    await tx.post.delete({ where: { id } })
+    await tx.user.update({
+      where: { id: existing.authorId },
+      data: { postCount: { decrement: 1 } },
+    })
   })
 
   // 清理引用的本地图片（unlink 失败只记日志，不影响主流程）

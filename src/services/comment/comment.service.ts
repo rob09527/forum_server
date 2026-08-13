@@ -78,62 +78,64 @@ export async function createComment(
     throw new NotFoundError('帖子', ErrorCode.POST_NOT_FOUND)
   }
 
-  // 楼中楼回复：校验 parent 存在且属于同一帖子
-  let floor: number | null = null
-  if (input.parentId) {
-    const parent = await prisma.comment.findUnique({
-      where: { id: input.parentId },
-      select: { id: true, postId: true },
-    })
-    if (!parent) {
-      throw new NotFoundError('评论', ErrorCode.COMMENT_NOT_FOUND)
-    }
-    if (parent.postId !== postId) {
-      throw new ValidationError('回复的评论不属于该帖子', ErrorCode.COMMENT_PARENT_MISMATCH)
-    }
-    // 楼中楼回复不分配楼层号（floor=null），父楼层的归属靠 parentId 表达。
-    // 若存 parent.floor，会与 @@unique([postId, floor]) 冲突（多回复同一楼层时唯一约束报错）
-    floor = null
-  } else {
-    // 顶层评论：分配下一个楼层号（该帖子下最大楼层 +1）
-    const last = await prisma.comment.aggregate({
-      where: { postId },
-      _max: { floor: true },
-    })
-    floor = (last._max.floor ?? 0) + 1
-  }
+  // 「发评论 → 计数/发分」原子化（顶层含楼层锁）。两分支返回同一形状 { comment, result }
+  const { comment, result } = input.parentId
+    ? await prisma.$transaction(async (tx) => {
+        // 楼中楼回复：校验 parent 存在且属于同一帖子
+        const parent = await tx.comment.findUnique({
+          where: { id: input.parentId! },
+          select: { id: true, postId: true },
+        })
+        if (!parent) {
+          throw new NotFoundError('评论', ErrorCode.COMMENT_NOT_FOUND)
+        }
+        if (parent.postId !== postId) {
+          throw new ValidationError('回复的评论不属于该帖子', ErrorCode.COMMENT_PARENT_MISMATCH)
+        }
+        // 楼中楼回复不分配楼层号（floor=null），父楼层的归属靠 parentId 表达。
+        // 若存 parent.floor，会与 @@unique([postId, floor]) 冲突（多回复同一楼层时唯一约束报错）
+        const created = await tx.comment.create({
+          data: { content, postId, authorId, parentId: input.parentId, floor: null },
+          include: {
+            author: { select: { id: true, username: true, avatar: true, level: true } },
+          },
+        })
+        const res = await earnPoints(authorId, PointType.COMMENT, { refId: created.id }, tx)
+        return { comment: created, result: res }
+      })
+    : await prisma.$transaction(async (tx) => {
+        // 顶层评论：分配下一个楼层号（该帖子下最大楼层 +1）。
+        // 事务内 FOR UPDATE 锁定帖子行，串行化同帖并发评论的楼层分配，避免撞 @@unique([postId, floor]) 落 500。
+        await tx.$queryRaw`SELECT id FROM "posts" WHERE id = ${postId} FOR UPDATE`
 
-  const comment = await prisma.comment.create({
-    data: {
-      content,
-      postId,
-      authorId,
-      parentId: input.parentId ?? null,
-      floor,
-    },
-    include: {
-      author: {
-        select: { id: true, username: true, avatar: true, level: true },
-      },
-    },
-  })
+        const last = await tx.comment.aggregate({
+          where: { postId },
+          _max: { floor: true },
+        })
+        const floor = (last._max.floor ?? 0) + 1
 
-  // 只有顶层评论才计入评论总数
-  if (!input.parentId) {
-    await Promise.all([
-      prisma.post.update({
-        where: { id: postId },
-        data: { commentCount: { increment: 1 } },
-      }),
-      prisma.user.update({
-        where: { id: authorId },
-        data: { commentCount: { increment: 1 } },
-      }),
-    ])
-  }
+        const created = await tx.comment.create({
+          data: { content, postId, authorId, parentId: null, floor },
+          include: {
+            author: { select: { id: true, username: true, avatar: true, level: true } },
+          },
+        })
 
-  // [R2] 评论 +3 鸡腿（含楼中楼回复），当日最多 10 条有分，超限静默跳过
-  const result = await earnPoints(authorId, PointType.COMMENT, { refId: comment.id })
+        // 顶层评论计入评论总数：post.commentCount +1、user.commentCount +1，同事务避免脏数据
+        await Promise.all([
+          tx.post.update({
+            where: { id: postId },
+            data: { commentCount: { increment: 1 } },
+          }),
+          tx.user.update({
+            where: { id: authorId },
+            data: { commentCount: { increment: 1 } },
+          }),
+        ])
+
+        const res = await earnPoints(authorId, PointType.COMMENT, { refId: created.id }, tx)
+        return { comment: created, result: res }
+      })
 
   const item = toItem(comment)
   // 升级即时生效：返回给前端的作者等级覆盖为升级后的值 [R22]
@@ -263,19 +265,22 @@ export async function deleteComment(id: number, user: UserPublic): Promise<void>
     throw new ForbiddenError('只能删除自己的评论', ErrorCode.COMMENT_NOT_OWNER)
   }
 
-  await prisma.comment.delete({ where: { id } })
+  // 删除评论 + 顶层评论的帖子计数回退，同事务避免「删了但计数没减」
+  await prisma.$transaction(async (tx) => {
+    await tx.comment.delete({ where: { id } })
 
-  // 顶层评论被删 → 帖子评论数 -1
-  if (!existing.parentId) {
-    await prisma.post.update({
-      where: { id: existing.postId },
-      data: { commentCount: { decrement: 1 } },
-    })
-  }
+    // 顶层评论被删 → 帖子评论数 -1
+    if (!existing.parentId) {
+      await tx.post.update({
+        where: { id: existing.postId },
+        data: { commentCount: { decrement: 1 } },
+      })
+    }
+  })
 }
 
-/** 将 Prisma Comment（含 author）转为列表项 */
-function toItem(comment: {
+/** Prisma Comment 含 author 摘要的查询结果形态（create/update/findMany 均返回此形状） */
+type CommentWithAuthor = {
   id: number
   content: string
   postId: number
@@ -284,7 +289,10 @@ function toItem(comment: {
   likeCount: number
   createdAt: Date
   author: { id: number; username: string; avatar: string | null; level: string }
-}): CommentItem {
+}
+
+/** 将 Prisma Comment（含 author）转为列表项 */
+function toItem(comment: CommentWithAuthor): CommentItem {
   return {
     id: comment.id,
     content: comment.content,

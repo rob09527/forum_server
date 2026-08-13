@@ -2,6 +2,7 @@ import type { FastifyInstance, FastifyRequest } from 'fastify'
 import { sendSuccess } from '../utils/response.js'
 import { authenticate, optionalAuth } from '../middleware/auth.middleware.js'
 import { ValidationError } from '../utils/errors.js'
+import { parseId } from '../utils/parse.js'
 import {
   createComment,
   listPostComments,
@@ -30,7 +31,7 @@ export async function commentRoutes(fastify: FastifyInstance): Promise<void> {
     const query = request.query as { page?: number; pageSize?: number }
 
     const result = await listPostComments(
-      Number(postId),
+      parseId(postId),
       query.page ? Number(query.page) : 1,
       query.pageSize ? Number(query.pageSize) : 20,
     )
@@ -38,13 +39,25 @@ export async function commentRoutes(fastify: FastifyInstance): Promise<void> {
   })
 
   /** POST /api/posts/:postId/comments — 发评论/楼中楼回复 */
-  fastify.post('/api/posts/:postId/comments', { preHandler: [authenticate] }, async (request, reply) => {
+  fastify.post('/api/posts/:postId/comments', {
+    preHandler: [authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        required: ['content'],
+        properties: {
+          content: { type: 'string', minLength: 1 },
+          parentId: { type: ['integer', 'null'], minimum: 1 },
+        },
+      },
+    },
+  }, async (request, reply) => {
     const user = requireUser(request)
     const { postId } = request.params as { postId: string }
     const body = request.body as { content: string; parentId?: number | null }
 
     const comment = await createComment(
-      Number(postId),
+      parseId(postId),
       { content: body.content, parentId: body.parentId ?? null },
       user.id,
     )
@@ -52,12 +65,23 @@ export async function commentRoutes(fastify: FastifyInstance): Promise<void> {
   })
 
   /** PATCH /api/comments/:id — 编辑评论（仅作者） */
-  fastify.patch('/api/comments/:id', { preHandler: [authenticate] }, async (request, reply) => {
+  fastify.patch('/api/comments/:id', {
+    preHandler: [authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        required: ['content'],
+        properties: {
+          content: { type: 'string', minLength: 1 },
+        },
+      },
+    },
+  }, async (request, reply) => {
     const user = requireUser(request)
     const { id } = request.params as { id: string }
     const body = request.body as { content: string }
 
-    const comment = await updateComment(Number(id), body.content, user.id)
+    const comment = await updateComment(parseId(id), body.content, user.id)
     sendSuccess(reply, comment)
   })
 
@@ -66,7 +90,7 @@ export async function commentRoutes(fastify: FastifyInstance): Promise<void> {
     const user = requireUser(request)
     const { id } = request.params as { id: string }
 
-    await deleteComment(Number(id), user)
+    await deleteComment(parseId(id), user)
     sendSuccess(reply, null)
   })
 
@@ -75,7 +99,7 @@ export async function commentRoutes(fastify: FastifyInstance): Promise<void> {
     const user = requireUser(request)
     const { id } = request.params as { id: string }
 
-    const likeCount = await likeComment(Number(id), user.id)
+    const likeCount = await likeComment(parseId(id), user.id)
     sendSuccess(reply, { likeCount })
   })
 
@@ -84,7 +108,7 @@ export async function commentRoutes(fastify: FastifyInstance): Promise<void> {
     const user = requireUser(request)
     const { id } = request.params as { id: string }
 
-    const likeCount = await unlikeComment(Number(id), user.id)
+    const likeCount = await unlikeComment(parseId(id), user.id)
     sendSuccess(reply, { likeCount })
   })
 }

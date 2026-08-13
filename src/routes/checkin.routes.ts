@@ -1,7 +1,6 @@
 import type { FastifyInstance } from 'fastify'
 import { checkin, checkinStatus } from '../services/checkin/checkin.service.js'
 import { authenticate } from '../middleware/auth.middleware.js'
-import { ValidationError } from '../utils/errors.js'
 import { sendSuccess } from '../utils/response.js'
 
 /**
@@ -14,15 +13,21 @@ export async function checkinRoutes(fastify: FastifyInstance): Promise<void> {
    * 签到状态：连续/累计天数、今日是否已签、今日可得鸡腿、指定月签到日历。
    * 需登录。
    */
-  fastify.get('/api/checkin/status', { preHandler: [authenticate] }, async (request, reply) => {
-    const month = request.query as { month?: string }
+  fastify.get('/api/checkin/status', {
+    preHandler: [authenticate],
+    schema: {
+      querystring: {
+        type: 'object',
+        properties: {
+          // month 可选，格式 YYYY-MM（1-12 月）
+          month: { type: 'string', pattern: '^\\d{4}-(0[1-9]|1[0-2])$' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const { month } = request.query as { month?: string }
 
-    // month 可选，格式 YYYY-MM（1-12 月）
-    if (month.month !== undefined && !/^\d{4}-(0[1-9]|1[0-2])$/.test(month.month)) {
-      throw new ValidationError('月份格式应为 YYYY-MM')
-    }
-
-    const status = await checkinStatus(request.user!.id, month.month)
+    const status = await checkinStatus(request.user!.id, month)
     sendSuccess(reply, status)
   })
 

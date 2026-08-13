@@ -1,8 +1,9 @@
 import type { FastifyInstance } from 'fastify'
 import { getUserProfile, getUserPointsLog, updateAvatar } from '../services/user/user.service.js'
 import { authenticate } from '../middleware/auth.middleware.js'
-import { ValidationError } from '../utils/errors.js'
+import { parseId } from '../utils/parse.js'
 import { sendSuccess } from '../utils/response.js'
+import { ALLOWED_AVATAR_STYLES } from '../constants/business.js'
 
 /**
  * 用户公开资料相关路由。
@@ -15,10 +16,7 @@ export async function userRoutes(fastify: FastifyInstance): Promise<void> {
    */
   fastify.get('/api/user/:id/profile', async (request, reply) => {
     const { id } = request.params as { id: string }
-    const userId = Number(id)
-    if (!Number.isInteger(userId) || userId < 1) {
-      throw new ValidationError('用户 ID 必须是正整数')
-    }
+    const userId = parseId(id)
 
     const profile = await getUserProfile(userId)
     sendSuccess(reply, profile)
@@ -30,10 +28,7 @@ export async function userRoutes(fastify: FastifyInstance): Promise<void> {
    */
   fastify.get('/api/user/:id/points-log', async (request, reply) => {
     const { id } = request.params as { id: string }
-    const userId = Number(id)
-    if (!Number.isInteger(userId) || userId < 1) {
-      throw new ValidationError('用户 ID 必须是正整数')
-    }
+    const userId = parseId(id)
 
     const query = request.query as { page?: string; pageSize?: string }
     const page = Number(query.page ?? 1)
@@ -48,11 +43,20 @@ export async function userRoutes(fastify: FastifyInstance): Promise<void> {
    * 更新当前用户的 DiceBear 头像风格（需登录）。
    * Body: { style: string }
    */
-  fastify.put('/api/user/me/avatar', { preHandler: [authenticate] }, async (request, reply) => {
-    const { style, seed } = request.body as { style?: string; seed?: string }
-    if (!style || typeof style !== 'string') {
-      throw new ValidationError('请提供头像风格（style）')
-    }
+  fastify.put('/api/user/me/avatar', {
+    preHandler: [authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        required: ['style'],
+        properties: {
+          style: { type: 'string', enum: [...ALLOWED_AVATAR_STYLES] },
+          seed: { type: 'string' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const { style, seed } = request.body as { style: string; seed?: string }
 
     const updated = await updateAvatar(request.user!.id, style, seed)
     sendSuccess(reply, { avatar: updated.avatar })

@@ -5,8 +5,12 @@ import cors from '@fastify/cors'
 import cookie from '@fastify/cookie'
 import multipart from '@fastify/multipart'
 import fastifyStatic from '@fastify/static'
+import rateLimit from '@fastify/rate-limit'
 import { config } from './config.js'
 import { ErrorCode } from './constants/error-codes.js'
+import { AppError } from './utils/errors.js'
+import { validationMessage } from './utils/validation.js'
+import { csrfGuard } from './plugins/csrf.js'
 import { authRoutes } from './routes/auth.routes.js'
 import { categoryRoutes } from './routes/category.routes.js'
 import { postRoutes } from './routes/post.routes.js'
@@ -37,14 +41,14 @@ fastify.setErrorHandler((rawError, _request, reply) => {
     })
   }
 
-  // 2. Fastify 内置的 validation error
+  // 2. Fastify 内置的 validation error（schema 校验失败）
   const fastifyErr = rawError as { validation?: unknown; statusCode?: number; message?: string }
   if (fastifyErr.validation) {
     return reply.status(400).send({
       success: false,
       error: {
         code: ErrorCode.VALIDATION_ERROR,
-        message: fastifyErr.message || '参数校验失败',
+        message: validationMessage(fastifyErr),
       },
     })
   }
@@ -71,13 +75,32 @@ fastify.setNotFoundHandler((_request, reply) => {
   })
 })
 
+// 允许的浏览器源（CORS 与 CSRF 共用）；生产环境需替换为真实域名
+const ALLOWED_ORIGINS = ['http://localhost:3000']
+
 // --- Plugins ---
 await fastify.register(cors, {
-  origin: ['http://localhost:3000'], // Nuxt dev server
+  origin: ALLOWED_ORIGINS, // Nuxt dev server
   credentials: true,
 })
 
+// CSRF 纵深防御：写操作校验 Origin/Referer（SameSite=lax 之外的第二重防线）。
+// 必须用 addHook 挂在 root 实例上，不能 register 成插件——插件会创建子上下文，钩子会被封装、作用不到全局路由。
+fastify.addHook('onRequest', csrfGuard(ALLOWED_ORIGINS))
+
 await fastify.register(cookie)
+
+// 全局限流：默认每 IP 每分钟 100 次。认证端点（login/register/telegram）在路由内按需收紧到 5 次。
+// errorResponseBuilder 统一错误格式，避免破坏前端 extractErrorMessage 的解析。
+await fastify.register(rateLimit, {
+  global: true,
+  max: 100,
+  timeWindow: '1 minute',
+  // errorResponseBuilder 必须「throw」一个带 statusCode + code 的错误对象，
+  // 走全局 errorHandler 的 AppError 分支统一格式化（若返回 body 会被当 500 处理）。
+  errorResponseBuilder: (_request, _context) =>
+    new AppError('请求过于频繁，请稍后再试', 429, ErrorCode.RATE_LIMITED),
+})
 
 // multipart 文件上传（解析限制 = 单文件上限 + 1MB 缓冲，略大于应用层校验以先兜住大文件）
 await fastify.register(multipart, {

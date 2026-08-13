@@ -16,6 +16,8 @@ export const ErrorCode = {
   CONFLICT: 'CONFLICT',
   /** 请求过于频繁 */
   RATE_LIMITED: 'RATE_LIMITED',
+  /** 跨站请求伪造（Origin/Referer 校验失败） */
+  CSRF_REJECTED: 'CSRF_REJECTED',
 
   // ── 认证 ──
   /** 邮箱或密码错误（不区分具体原因，防枚举） */
