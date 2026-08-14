@@ -12,7 +12,8 @@ COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 RUN pnpm install --frozen-lockfile
 
 COPY . .
-RUN npx prisma generate && pnpm run build
+# prisma.config.ts 里 env('DATABASE_URL') 会在加载配置时解析；generate 不连库，给占位值即可（运行时走真实 env）
+RUN DATABASE_URL="postgresql://placeholder:placeholder@localhost:5432/placeholder" npx prisma generate && pnpm run build
 
 # 卷挂载目标：帖子图片运行时写入目录（docker-compose 挂载 ./data/uploads）
 RUN mkdir -p public/uploads
