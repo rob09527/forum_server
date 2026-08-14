@@ -1,9 +1,10 @@
 import { prisma } from '../../lib/prisma.js'
 import { ErrorCode } from '../../constants/error-codes.js'
-import { NotFoundError, ValidationError } from '../../utils/errors.js'
+import { NotFoundError, ValidationError, ForbiddenError } from '../../utils/errors.js'
 import { levelProgress } from '../points/points.service.js'
 import type { LevelProgress } from '../points/points.service.js'
-import { ALLOWED_AVATAR_STYLES } from '../../constants/business.js'
+import { ALLOWED_AVATAR_STYLES, AVATARS_PER_STYLE } from '../../constants/business.js'
+import type { UserStatusType } from '../../constants/business.js'
 import type { UserPublic } from '../auth/auth.service.js'
 
 /**
@@ -23,8 +24,8 @@ export interface UserProfile {
   bio: string | null
   /** 用户等级（按累计鸡腿实时计算，[R21] 权威来源在 points.service） */
   level: string
-  /** 鸡腿余额（可花费） */
-  points: number
+  /** 鸡腿余额（可花费）。仅本人可见，陌生人返回 null */
+  points: number | null
   /** 累计获得鸡腿，只增不减，决定等级 [R20] */
   totalPointsEarned: number
   /** 星辰（荣誉，只增不减，管理发放）[R30] */
@@ -64,8 +65,40 @@ export interface Paginated<T> {
   totalPages: number
 }
 
-/** 查询用户公开资料 */
-export async function getUserProfile(userId: number): Promise<UserProfile> {
+/** 最新注册用户项（侧边栏「欢迎新用户」展示用） */
+export interface NewUserItem {
+  /** 用户 ID */
+  id: number
+  /** 用户名 */
+  username: string
+  /** 头像 URL，null 时前端用默认头像 */
+  avatar: string | null
+  /** 注册时间，ISO 8601 */
+  createdAt: string
+}
+
+/**
+ * 最新注册用户 Top N（按注册时间倒序），侧边栏「欢迎新用户」模块用。
+ */
+export async function getLatestUsers(limit = 8): Promise<NewUserItem[]> {
+  const take = Math.min(50, Math.max(1, limit))
+
+  const users = await prisma.user.findMany({
+    orderBy: { createdAt: 'desc' },
+    take,
+    select: { id: true, username: true, avatar: true, createdAt: true },
+  })
+
+  return users.map((u) => ({
+    id: u.id,
+    username: u.username,
+    avatar: u.avatar,
+    createdAt: u.createdAt.toISOString(),
+  }))
+}
+
+/** 查询用户公开资料。viewerId 为当前登录用户，鸡腿余额仅本人可见（陌生人返回 null）。 */
+export async function getUserProfile(userId: number, viewerId?: number): Promise<UserProfile> {
   const user = await prisma.user.findUnique({
     where: { id: userId },
     select: {
@@ -95,7 +128,7 @@ export async function getUserProfile(userId: number): Promise<UserProfile> {
     avatar: user.avatar,
     bio: user.bio,
     level: progress.level,
-    points: user.points,
+    points: viewerId === userId ? user.points : null,
     totalPointsEarned: user.totalPointsEarned,
     stars: user.stars,
     postCount: user.postCount,
@@ -105,12 +138,17 @@ export async function getUserProfile(userId: number): Promise<UserProfile> {
   }
 }
 
-/** 分页查询用户积分流水，按时间倒序 */
+/** 分页查询用户积分流水，按时间倒序。仅本人可见（viewerId 非本人抛 403）。 */
 export async function getUserPointsLog(
   userId: number,
+  viewerId: number,
   page = 1,
   pageSize = 20,
 ): Promise<Paginated<PointLogItem>> {
+  if (viewerId !== userId) {
+    throw new ForbiddenError('积分流水仅本人可见')
+  }
+
   const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true } })
   if (!user) {
     throw new NotFoundError('用户', ErrorCode.NOT_FOUND)
@@ -151,37 +189,33 @@ export async function getUserPointsLog(
   }
 }
 
-/** DiceBear 头像 URL 模板（9.x） */
-function dicebearAvatarUrl(style: string, seed: string): string {
-  return `https://api.dicebear.com/9.x/${style}/svg?seed=${encodeURIComponent(seed)}`
-}
+/** 本地预置头像路径格式：/avatars/{style}/avatar-{nn}.svg */
+const LOCAL_AVATAR_RE = /^\/avatars\/([a-z0-9-]+)\/avatar-(\d{2})\.svg$/
 
 /**
- * 更新当前用户的 DiceBear 头像风格。
- * 把对应 DiceBear URL 写入 avatar 字段；TG 照片会被覆盖。
+ * 更新当前用户的头像为本地预置头像（无外网依赖）。
  * @param userId 用户 ID
- * @param style DiceBear 风格名
- * @param seed 可选种子，默认用用户名；传自定义种子可在同风格下切换不同头像
+ * @param avatar 本地头像路径，如 /avatars/bottts-neutral/avatar-03.svg
  * @returns 更新后的用户公开信息
  */
-export async function updateAvatar(userId: number, style: string, seed?: string): Promise<UserPublic> {
-  if (!ALLOWED_AVATAR_STYLES.includes(style as any)) {
+export async function updateAvatar(userId: number, avatar: string): Promise<UserPublic> {
+  const m = LOCAL_AVATAR_RE.exec(avatar)
+  const index = m ? Number(m[2]) : 0
+  if (!m || !ALLOWED_AVATAR_STYLES.includes(m[1] as any) || index < 1 || index > AVATARS_PER_STYLE) {
     throw new ValidationError(
-      `不支持的头像风格: ${style}，可选值: ${ALLOWED_AVATAR_STYLES.join(', ')}`,
+      `无效的头像路径: ${avatar}，格式应为 /avatars/{风格}/avatar-01~${String(AVATARS_PER_STYLE).padStart(2, '0')}.svg`,
       ErrorCode.VALIDATION_ERROR,
     )
   }
 
-  const user = await prisma.user.findUnique({ where: { id: userId }, select: { username: true } })
+  const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true } })
   if (!user) {
     throw new NotFoundError('用户', ErrorCode.NOT_FOUND)
   }
 
-  const avatarUrl = dicebearAvatarUrl(style, seed ?? user.username)
-
   const updated = await prisma.user.update({
     where: { id: userId },
-    data: { avatar: avatarUrl },
+    data: { avatar },
     select: {
       id: true,
       username: true,
@@ -192,10 +226,11 @@ export async function updateAvatar(userId: number, style: string, seed?: string)
       points: true,
       stars: true,
       role: true,
+      status: true,
       oauthProvider: true,
       createdAt: true,
     },
   })
 
-  return updated
+  return { ...updated, status: updated.status as UserStatusType }
 }

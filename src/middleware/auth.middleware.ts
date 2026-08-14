@@ -1,7 +1,8 @@
 import type { FastifyRequest, FastifyReply } from 'fastify'
 import { verifyToken, SESSION_COOKIE } from '../services/auth/auth-token.service.js'
 import { getUserById } from '../services/auth/auth.service.js'
-import { UnauthorizedError } from '../utils/errors.js'
+import { UnauthorizedError, ForbiddenError } from '../utils/errors.js'
+import { ErrorCode } from '../constants/error-codes.js'
 import type { UserPublic } from '../services/auth/auth.service.js'
 
 /**
@@ -40,6 +41,11 @@ export async function authenticate(
   if (!user) {
     // token 有效但用户被删了
     throw new UnauthorizedError()
+  }
+
+  // 封禁账号即使 token 未过期也拒绝访问（登录时已拦，这里是已登录请求的第二道闸）
+  if (user.status === 'banned') {
+    throw new ForbiddenError('账号已被封禁', ErrorCode.ACCOUNT_BANNED)
   }
 
   request.user = user

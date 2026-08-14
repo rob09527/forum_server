@@ -11,6 +11,8 @@ import { ErrorCode } from './constants/error-codes.js'
 import { AppError } from './utils/errors.js'
 import { validationMessage } from './utils/validation.js'
 import { csrfGuard } from './plugins/csrf.js'
+import { announcementRoutes } from './routes/announcement.routes.js'
+import { advertRoutes } from './routes/advert.routes.js'
 import { authRoutes } from './routes/auth.routes.js'
 import { categoryRoutes } from './routes/category.routes.js'
 import { postRoutes } from './routes/post.routes.js'
@@ -18,6 +20,7 @@ import { commentRoutes } from './routes/comment.routes.js'
 import { uploadRoutes } from './routes/upload.routes.js'
 import { checkinRoutes } from './routes/checkin.routes.js'
 import { userRoutes } from './routes/user.routes.js'
+import { adminRoutes } from './routes/admin.routes.js'
 import { sendSuccess } from './utils/response.js'
 
 export const fastify = Fastify({ logger: true })
@@ -119,6 +122,8 @@ await fastify.register(fastifyStatic, {
 })
 
 // --- Routes ---
+await fastify.register(announcementRoutes)
+await fastify.register(advertRoutes)
 await fastify.register(authRoutes)
 await fastify.register(categoryRoutes)
 await fastify.register(postRoutes)
@@ -126,6 +131,7 @@ await fastify.register(commentRoutes)
 await fastify.register(uploadRoutes)
 await fastify.register(checkinRoutes)
 await fastify.register(userRoutes)
+await fastify.register(adminRoutes)
 
 // [规范例外] health check 和 /test-tg 的查询/读文件逻辑直接写在这里，
 // 因为没有对应的 service，为 3 行逻辑新建 service 文件反而过度

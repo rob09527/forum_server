@@ -1,6 +1,6 @@
 import { prisma } from '../../lib/prisma.js'
 import { config } from '../../config.js'
-import { Category, CategoryType, PointType, UserRole } from '../../constants/business.js'
+import { PointType, UserRole } from '../../constants/business.js'
 import {
   NotFoundError,
   ForbiddenError,
@@ -18,7 +18,7 @@ export interface CreatePostInput {
   title: string
   /** Markdown 格式正文，至少 POST_MIN_CONTENT_LENGTH 字符 */
   content: string
-  /** 所属板块，必须为 Category 枚举值 */
+  /** 所属板块，必须为已启用的分类 slug（categories 表） */
   category: string
   /** 标签列表，最多 5 个，每个最长 20 字符 */
   tags?: string[]
@@ -40,6 +40,8 @@ export interface PostListQuery {
   category?: string
   /** 标签筛选，不传不过滤 */
   tag?: string
+  /** 作者筛选，不传返回全部（「我的帖子」用） */
+  authorId?: number
   /** 排序：latest(最新) | hot(最热)，默认 latest */
   sort?: 'latest' | 'hot'
   /** 页码，从 1 开始 */
@@ -143,8 +145,11 @@ export async function createPost(input: CreatePostInput, authorId: number): Prom
     throw new ValidationError(`正文至少 ${config.POST_MIN_CONTENT_LENGTH} 个字符`, ErrorCode.POST_CONTENT_TOO_SHORT)
   }
 
-  // 板块合法性校验
-  if (!Object.values(Category).includes(category as CategoryType)) {
+  // 板块合法性校验（分类由 categories 表驱动，必须存在且启用）
+  const categoryExists = await prisma.category.findFirst({
+    where: { slug: category, isEnabled: true },
+  })
+  if (!categoryExists) {
     throw new ValidationError('无效的板块', ErrorCode.POST_CATEGORY_INVALID)
   }
 
@@ -261,16 +266,19 @@ export async function listPosts(query: PostListQuery): Promise<Paginated<PostLis
   const sort = query.sort ?? 'latest'
   const category = query.category
   const tag = query.tag
+  const authorId = query.authorId
 
-  // 板块筛选（传了但无效 → 抛错；不传 → 全部）
-  if (category && !Object.values(Category).includes(category as CategoryType)) {
-    throw new ValidationError('无效的板块', ErrorCode.POST_CATEGORY_INVALID)
+  // 作者筛选：必须为正整数，非法值直接抛错（避免 where authorId: NaN 静默返回空）
+  if (authorId !== undefined && (!Number.isInteger(authorId) || authorId < 1)) {
+    throw new ValidationError('作者 ID 必须是正整数', ErrorCode.VALIDATION_ERROR)
   }
 
   const where = {
     ...(category ? { category } : {}),
     // 标签筛选：TEXT[] 数组包含该标签
     ...(tag ? { tags: { has: tag } } : {}),
+    // 作者筛选：只查某位用户发布的帖子
+    ...(authorId ? { authorId } : {}),
   }
 
   // hot：最近 7 天 + 按热度分（heatScore）降序，与侧边栏热榜同一算法，不设 isHot 标记
@@ -388,16 +396,13 @@ export async function updatePost(id: number, input: UpdatePostInput, userId: num
 }
 
 /**
- * 删除帖子（硬删除）。
- * 仅作者本人或 admin 可删。级联删除评论/点赞，并清理 content 引用的本地图片。
+ * 执行帖子硬删除（无权限判断，权限由调用方保证）。
+ * 级联删除评论/点赞，并清理 content 引用的本地图片。
  */
-export async function deletePost(id: number, user: UserPublic): Promise<void> {
+async function performDelete(id: number): Promise<void> {
   const existing = await prisma.post.findUnique({ where: { id } })
   if (!existing) {
     throw new NotFoundError('帖子', ErrorCode.POST_NOT_FOUND)
-  }
-  if (existing.authorId !== user.id && user.role !== UserRole.ADMIN) {
-    throw new ForbiddenError('只能删除自己的帖子', ErrorCode.POST_NOT_OWNER)
   }
 
   // 提取正文中引用的本地图片路径（相对路径 /uploads/...）
@@ -416,6 +421,30 @@ export async function deletePost(id: number, user: UserPublic): Promise<void> {
 
   // 清理引用的本地图片（unlink 失败只记日志，不影响主流程）
   await cleanPostImages(existing.authorId, imagePaths)
+}
+
+/**
+ * 删除帖子（硬删除）。
+ * 仅作者本人或 admin 可删。
+ */
+export async function deletePost(id: number, user: UserPublic): Promise<void> {
+  const existing = await prisma.post.findUnique({ where: { id } })
+  if (!existing) {
+    throw new NotFoundError('帖子', ErrorCode.POST_NOT_FOUND)
+  }
+  if (existing.authorId !== user.id && user.role !== UserRole.ADMIN) {
+    throw new ForbiddenError('只能删除自己的帖子', ErrorCode.POST_NOT_OWNER)
+  }
+
+  await performDelete(id)
+}
+
+/**
+ * 管理端删除帖子（X-Admin-Key 已鉴权，无需再判所有权）。
+ * 由 Cool Admin 后端通过 /api/admin/posts/:id/delete 调用。
+ */
+export async function deletePostById(id: number): Promise<void> {
+  await performDelete(id)
 }
 
 /** 首页热门帖子 Top N（侧边栏用，不传 category 或传全部） */

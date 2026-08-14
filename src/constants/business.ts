@@ -13,7 +13,10 @@ export const UserLevel = {
 } as const
 export type UserLevelType = (typeof UserLevel)[keyof typeof UserLevel]
 
-/** 帖子板块（前后端统一，由后端常量控制） */
+/**
+ * 帖子板块历史常量（已迁移为 DB 驱动，见 categories 表 / category.service.ts）。
+ * 保留仅作为默认 9 个板块的 seed 来源与兼容占位，业务代码不再引用（发帖校验与列表均走 DB）。
+ */
 export const Category = {
   /** 综合讨论 */
   GENERAL: 'general',
@@ -71,17 +74,6 @@ export const SortOrder = {
 } as const
 export type SortOrderType = (typeof SortOrder)[keyof typeof SortOrder]
 
-/** 通知类型 */
-export const NotificationType = {
-  /** @提及 */
-  MENTION: 'mention',
-  /** 评论回复 */
-  REPLY: 'reply',
-  /** 系统通知 */
-  SYSTEM: 'system',
-} as const
-export type NotificationTypeType = (typeof NotificationType)[keyof typeof NotificationType]
-
 /** 积分变动类型 */
 export const PointType = {
   /** 签到奖励 */
@@ -108,7 +100,18 @@ export const UserRole = {
 } as const
 export type UserRoleType = (typeof UserRole)[keyof typeof UserRole]
 
-/** 允许的 DiceBear 头像风格（9.x 版本） */
+/** 用户账号状态（封禁/禁言） */
+export const UserStatus = {
+  /** 正常 */
+  ACTIVE: 'active',
+  /** 封禁（禁止登录，踢下线） */
+  BANNED: 'banned',
+  /** 禁言（可登录，禁止发帖/评论） */
+  MUTED: 'muted',
+} as const
+export type UserStatusType = (typeof UserStatus)[keyof typeof UserStatus]
+
+/** 允许的头像风格（本地预置头像目录，对应前端 public/avatars/ 子目录） */
 export const ALLOWED_AVATAR_STYLES = [
   'bottts-neutral',
   'avataaars',
@@ -116,8 +119,6 @@ export const ALLOWED_AVATAR_STYLES = [
   'identicon',
   'lorelei',
   'thumbs',
-  'rings',
-  'shapes',
   'adventurer',
   'adventurer-neutral',
   'big-ears',
@@ -126,7 +127,6 @@ export const ALLOWED_AVATAR_STYLES = [
   'croodles',
   'croodles-neutral',
   'fun-emoji',
-  'glass',
   'micah',
   'miniavs',
   'notionists',
@@ -135,6 +135,31 @@ export const ALLOWED_AVATAR_STYLES = [
   'personas',
 ] as const
 export type AvatarStyleType = (typeof ALLOWED_AVATAR_STYLES)[number]
+
+/** 每个风格的本地预置头像数量（avatar-01.svg ~ avatar-20.svg） */
+export const AVATARS_PER_STYLE = 20
+
+/** 公告类型（前台公告栏圆点颜色按此分类） */
+export const AnnouncementType = {
+  /** 普通 */
+  NORMAL: 'normal',
+  /** 重要 */
+  IMPORTANT: 'important',
+  /** 紧急 */
+  URGENT: 'urgent',
+  /** 活动 */
+  ACTIVITY: 'activity',
+} as const
+export type AnnouncementTypeType = (typeof AnnouncementType)[keyof typeof AnnouncementType]
+
+/** 广告位位置（前台渲染位置按此分类；top 顶部横幅已下线） */
+export const AdvertPosition = {
+  /** 侧边栏 */
+  SIDEBAR: 'sidebar',
+  /** 帖子列表内嵌 */
+  INLINE: 'inline',
+} as const
+export type AdvertPositionType = (typeof AdvertPosition)[keyof typeof AdvertPosition]
 
 /** OAuth 第三方来源 */
 export const OAuthProvider = {

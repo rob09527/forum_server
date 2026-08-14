@@ -30,6 +30,10 @@ export const ErrorCode = {
   USERNAME_TAKEN: 'USERNAME_TAKEN',
   /** TG 授权数据验签失败 */
   INVALID_TELEGRAM_AUTH: 'INVALID_TELEGRAM_AUTH',
+  /** 账号已被封禁 */
+  ACCOUNT_BANNED: 'ACCOUNT_BANNED',
+  /** 账号已被禁言 */
+  ACCOUNT_MUTED: 'ACCOUNT_MUTED',
 
   // ── 签到 ──
   /** 今天已经签到过了 */

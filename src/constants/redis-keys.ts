@@ -9,12 +9,12 @@ export const RedisKey = {
   // ── 会话 ──
   /** 用户登录会话，key 为 token，value 为 userId */
   session: (token: string) => `session:${token}` as const,
+  /** 用户的全部 session token 集合（SET），key 为 userId，用于封禁时批量下线 */
+  userSessions: (userId: number) => `user:${userId}:sessions` as const,
 
   // ── 用户缓存 ──
   /** 用户公开资料缓存 */
   userProfile: (id: number) => `user:${id}:profile` as const,
-  /** 用户未读通知数 */
-  userUnread: (id: number) => `user:${id}:unread` as const,
 
   // ── 帖子缓存 ──
   /** 帖子详情缓存 */

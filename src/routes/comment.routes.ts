@@ -1,7 +1,9 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify'
 import { sendSuccess } from '../utils/response.js'
 import { authenticate, optionalAuth } from '../middleware/auth.middleware.js'
-import { ValidationError } from '../utils/errors.js'
+import { ValidationError, ForbiddenError } from '../utils/errors.js'
+import { ErrorCode } from '../constants/error-codes.js'
+import { UserStatus } from '../constants/business.js'
 import { parseId } from '../utils/parse.js'
 import {
   createComment,
@@ -53,6 +55,10 @@ export async function commentRoutes(fastify: FastifyInstance): Promise<void> {
     },
   }, async (request, reply) => {
     const user = requireUser(request)
+    // 禁言用户禁止评论（可正常登录与浏览）
+    if (user.status === UserStatus.MUTED) {
+      throw new ForbiddenError('您已被禁言，无法评论', ErrorCode.ACCOUNT_MUTED)
+    }
     const { postId } = request.params as { postId: string }
     const body = request.body as { content: string; parentId?: number | null }
 

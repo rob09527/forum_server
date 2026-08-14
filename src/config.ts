@@ -25,6 +25,9 @@ const envSchema = z.object({
   /** Telegram Bot Token，用于 TG Login Widget 验签 */
   TELEGRAM_BOT_TOKEN: z.string().default(''),
 
+  /** 管理后台服务间密钥，admin 后端调用 /api/admin/* 时在 X-Admin-Key 头携带 */
+  FORUM_ADMIN_KEY: z.string().min(1),
+
   /** 单文件最大字节数，默认 10MB */
   UPLOAD_MAX_FILE_SIZE: z.coerce.number().int().positive().default(10485760),
   /** 单用户累计上传总字节数上限，默认 50MB */

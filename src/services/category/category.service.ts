@@ -1,5 +1,4 @@
 import { prisma } from '../../lib/prisma.js'
-import { Category, CategoryLabel, CategoryIcon } from '../../constants/business.js'
 
 /**
  * 全量标签池（约 1000 个），覆盖 AI 领域多个维度。
@@ -730,8 +729,7 @@ export function listTags(): string[] {
 
 /**
  * 分类服务。
- * 板块列表由 constants/business.ts 统一控制（后端是唯一数据源），
- * 这里负责叠加数据库里的真实帖子数统计。
+ * 板块列表由 categories 表驱动（后台可编辑），这里负责叠加数据库里的真实帖子数统计。
  */
 
 /** 单个板块信息 */
@@ -751,17 +749,24 @@ export interface CategoryItem {
  * 按 category 分组统计，一次查询取全量，避免 N+1。
  */
 export async function listCategories(): Promise<CategoryItem[]> {
-  const grouped = await prisma.post.groupBy({
-    by: ['category'],
-    _count: { _all: true },
-  })
+  // 分类由 categories 表驱动（后台可编辑），只返回启用中的板块
+  const [categories, grouped] = await Promise.all([
+    prisma.category.findMany({
+      where: { isEnabled: true },
+      orderBy: { sortOrder: 'asc' },
+    }),
+    prisma.post.groupBy({
+      by: ['category'],
+      _count: { _all: true },
+    }),
+  ])
 
   const countMap = new Map(grouped.map((g) => [g.category, g._count._all]))
 
-  return Object.values(Category).map((slug) => ({
-    slug,
-    name: CategoryLabel[slug],
-    icon: CategoryIcon[slug],
-    postCount: String(countMap.get(slug) ?? 0),
+  return categories.map((c) => ({
+    slug: c.slug,
+    name: c.name,
+    icon: c.icon,
+    postCount: String(countMap.get(c.slug) ?? 0),
   }))
 }

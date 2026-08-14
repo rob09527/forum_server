@@ -43,6 +43,9 @@ model User {
   /// 管理角色：user(普通用户) | mod(版主) | admin(管理员)
   role          String    @default("user")
 
+  /// 账号状态：active(正常) | banned(封禁) | muted(禁言)
+  status        String    @default("active")
+
   /// 第三方登录来源：'telegram' 表示 TG 用户；本站邮箱注册为 null
   oauthProvider String?
 
@@ -88,6 +91,7 @@ model User {
   /// 用户的评论点赞记录
   commentLikes  CommentLike[]
 
+  @@index([status])
   @@map("users")
 }
 
@@ -261,10 +265,10 @@ model PointLog {
   /// 用户
   user         User     @relation(fields: [userId], references: [id])
 
-  /// 积分来源：checkin(签到) | post(发帖) | comment(评论) | liked(被点赞)
+  /// 积分来源：checkin(签到) | post(发帖) | comment(评论) | liked(被点赞) | transfer(管理调整)
   type         String
 
-  /// 变动值（正数，MVP 无扣分场景）[R41]
+  /// 变动值（正数加分；transfer 管理调整可为负）[R41]
   delta        Int
 
   /// 变动后的鸡腿余额，用于流水对账 [R42]
@@ -273,9 +277,101 @@ model PointLog {
   /// 关联的帖子/评论 ID，用于溯源，无关联为 null
   refId        Int?
 
+  /// 操作者（管理调整 transfer 时记录是哪个管理员操作的），非 transfer 流水为 null
+  operator     String?
+
   /// 变动时间
   createdAt    DateTime @default(now())
 
   @@index([userId, createdAt(sort: Desc)])
   @@map("point_logs")
+}
+
+/// 论坛板块分类（DB 驱动，替代 constants/business.ts 里的写死常量）
+model Category {
+  /// 分类 ID，自增主键
+  id        Int      @id @default(autoincrement())
+
+  /// 板块 slug，对应 posts.category 字段值，唯一
+  slug      String   @unique
+
+  /// 板块中文名
+  name      String
+
+  /// 板块 emoji 图标
+  icon      String   @default("📂")
+
+  /// 排序权重，越小越靠前
+  sortOrder Int      @default(0)
+
+  /// 是否启用（禁用后从 /api/categories 隐藏、发帖不可选）
+  isEnabled Boolean  @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("categories")
+}
+
+/// 论坛公告
+model Announcement {
+  /// 公告 ID，自增主键
+  id        Int      @id @default(autoincrement())
+
+  /// 公告标题，1-200 字符
+  title     String
+
+  /// 公告类型：normal(普通) | important(重要) | urgent(紧急) | activity(活动)
+  type      String   @default("normal")
+
+  /// 跳转链接；站内路径(/post/1)或外链，null 表示不可点击
+  link      String?
+
+  /// 排序权重，越大越靠前
+  sortOrder Int      @default(0)
+
+  /// 是否上线（false 为草稿，前台不展示）
+  isActive  Boolean  @default(true)
+
+  /// 创建时间
+  createdAt DateTime @default(now())
+
+  /// 最后更新时间
+  updatedAt DateTime @updatedAt
+
+  @@index([isActive, sortOrder(sort: Desc)])
+  @@map("announcements")
+}
+
+/// 论坛广告位
+model Advert {
+  /// 广告 ID，自增主键
+  id        Int      @id @default(autoincrement())
+
+  /// 广告标题（后台识别 + img alt），可空
+  title     String?
+
+  /// banner 图片 URL（后台 cl-upload 返回的完整 URL）
+  image     String
+
+  /// 广告位置：sidebar(侧边栏) | inline(列表内嵌)
+  position  String   @default("sidebar")
+
+  /// 跳转链接；站内路径(/post/1)或外链，null 表示不可点击
+  link      String?
+
+  /// 排序权重，越大越靠前
+  sortOrder Int      @default(0)
+
+  /// 是否上线（false 为草稿，前台不展示）
+  isActive  Boolean  @default(true)
+
+  /// 创建时间
+  createdAt DateTime @default(now())
+
+  /// 最后更新时间
+  updatedAt DateTime @updatedAt
+
+  @@index([position, isActive, sortOrder(sort: Desc)])
+  @@map("adverts")
 }

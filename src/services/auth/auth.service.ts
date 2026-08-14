@@ -1,10 +1,12 @@
 import { createHash, createHmac } from 'crypto'
-import argon2 from 'argon2'
 import { nanoid } from 'nanoid'
 import { config } from '../../config.js'
 import { ErrorCode } from '../../constants/error-codes.js'
-import { OAuthProvider } from '../../constants/business.js'
-import { ConflictError, InvalidCredentialsError, UnauthorizedError } from '../../utils/errors.js'
+import { OAuthProvider, UserStatus } from '../../constants/business.js'
+import type { UserStatusType } from '../../constants/business.js'
+import { ConflictError, ForbiddenError, InvalidCredentialsError, UnauthorizedError } from '../../utils/errors.js'
+import { hashPassword, verifyPassword } from '../../utils/password.js'
+import { deterministicLocalAvatar } from '../../utils/avatar.js'
 import { generateToken } from './auth-token.service.js'
 import { prisma } from '../../lib/prisma.js'
 
@@ -16,7 +18,7 @@ export interface UserPublic {
   username: string
   /** 邮箱，唯一；TG 注册时为空(null)，绑定邮箱后才有值 */
   email: string | null
-  /** 头像 URL；TG 注册自动填 TG 头像；邮箱注册默认 null */
+  /** 头像 URL；TG 注册自动填 TG 头像；邮箱注册默认生成 DiceBear 机器人头像 */
   avatar: string | null
   /** 个人简介，最长 200 字符 */
   bio: string | null
@@ -28,6 +30,8 @@ export interface UserPublic {
   stars: number
   /** 管理角色：user(普通用户) | mod(版主) | admin(管理员) */
   role: string
+  /** 账号状态：active(正常) | banned(封禁) | muted(禁言) */
+  status: UserStatusType
   /** 第三方登录来源：'telegram' 表示 TG 用户；本站邮箱注册为 null */
   oauthProvider: string | null
   /** 注册时间，ISO 8601 格式 */
@@ -45,6 +49,7 @@ function toPublic(user: {
   points: number
   stars: number
   role: string
+  status: string
   oauthProvider: string | null
   createdAt: Date
 }): UserPublic {
@@ -58,6 +63,7 @@ function toPublic(user: {
     points: user.points,
     stars: user.stars,
     role: user.role,
+    status: user.status as UserStatusType,
     oauthProvider: user.oauthProvider,
     createdAt: user.createdAt,
   }
@@ -86,17 +92,15 @@ export async function register(input: {
     throw new ConflictError('该用户名已被占用', ErrorCode.USERNAME_TAKEN)
   }
 
-  const passwordHash = await argon2.hash(password, {
-    type: argon2.argon2id,
-    memoryCost: 65536, // 64 MiB
-    timeCost: 3,
-  })
+  const passwordHash = await hashPassword(password)
 
   const user = await prisma.user.create({
     data: {
       username,
       email,
       passwordHash,
+      // 邮箱注册按用户名确定性映射一个本地预置头像（与前端展示兜底同一算法，无外网依赖）
+      avatar: deterministicLocalAvatar(username),
       // oauthProvider 和 oauthId 留 null，表示本站邮箱注册
     },
     select: {
@@ -109,6 +113,7 @@ export async function register(input: {
       points: true,
       stars: true,
       role: true,
+      status: true,
       oauthProvider: true,
       createdAt: true,
     },
@@ -139,6 +144,7 @@ export async function login(input: {
       points: true,
       stars: true,
       role: true,
+      status: true,
       oauthProvider: true,
       createdAt: true,
       passwordHash: true,
@@ -150,9 +156,14 @@ export async function login(input: {
     throw new InvalidCredentialsError()
   }
 
-  const valid = await argon2.verify(user.passwordHash, password)
+  const valid = await verifyPassword(user.passwordHash, password)
   if (!valid) {
     throw new InvalidCredentialsError()
+  }
+
+  // 封禁账号拒绝登录（即使 token 被踢也能重登）
+  if (user.status === UserStatus.BANNED) {
+    throw new ForbiddenError('账号已被封禁', ErrorCode.ACCOUNT_BANNED)
   }
 
   const token = await generateToken(user.id)
@@ -227,12 +238,17 @@ export async function telegramAuth(
       points: true,
       stars: true,
       role: true,
+      status: true,
       oauthProvider: true,
       createdAt: true,
     },
   })
 
   if (existing) {
+    // 封禁账号拒绝登录（老用户也要查状态，否则被封后可绕过）
+    if (existing.status === UserStatus.BANNED) {
+      throw new ForbiddenError('账号已被封禁', ErrorCode.ACCOUNT_BANNED)
+    }
     // 老用户登录
     const token = await generateToken(existing.id)
     return { user: toPublic(existing), token, isNewUser: false }
@@ -262,6 +278,7 @@ export async function telegramAuth(
       points: true,
       stars: true,
       role: true,
+      status: true,
       oauthProvider: true,
       createdAt: true,
     },
@@ -305,6 +322,7 @@ export async function getUserById(userId: number): Promise<UserPublic | null> {
       points: true,
       stars: true,
       role: true,
+      status: true,
       oauthProvider: true,
       createdAt: true,
     },

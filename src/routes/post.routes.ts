@@ -1,9 +1,10 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify'
 import { sendSuccess } from '../utils/response.js'
 import { authenticate, optionalAuth } from '../middleware/auth.middleware.js'
-import { ValidationError } from '../utils/errors.js'
+import { ValidationError, ForbiddenError } from '../utils/errors.js'
+import { ErrorCode } from '../constants/error-codes.js'
+import { UserStatus } from '../constants/business.js'
 import { parseId } from '../utils/parse.js'
-import { Category } from '../constants/business.js'
 import {
   createPost,
   getPostById,
@@ -44,6 +45,8 @@ export async function postRoutes(fastify: FastifyInstance): Promise<void> {
       category?: string
       /** 按标签过滤（TEXT[] 包含该标签） */
       tag?: string
+      /** 按作者 ID 过滤（「我的帖子」用） */
+      authorId?: number
       sort?: 'latest' | 'hot'
       page?: number
       pageSize?: number
@@ -52,6 +55,7 @@ export async function postRoutes(fastify: FastifyInstance): Promise<void> {
     const result = await listPosts({
       category: query.category,
       tag: query.tag,
+      authorId: query.authorId ? Number(query.authorId) : undefined,
       sort: query.sort,
       page: query.page ? Number(query.page) : undefined,
       pageSize: query.pageSize ? Number(query.pageSize) : undefined,
@@ -66,10 +70,10 @@ export async function postRoutes(fastify: FastifyInstance): Promise<void> {
     sendSuccess(reply, hotPosts)
   })
 
-  /** GET /api/posts/:id — 帖子详情（可选登录，登录用户计入浏览量去重） */
-  fastify.get('/api/posts/:id', { preHandler: [optionalAuth] }, async (request, reply) => {
+  /** GET /api/posts/:id — 帖子详情（需登录，登录用户计入浏览量去重） */
+  fastify.get('/api/posts/:id', { preHandler: [authenticate] }, async (request, reply) => {
     const { id } = request.params as { id: string }
-    const post = await getPostById(parseId(id), request.user?.id)
+    const post = await getPostById(parseId(id), request.user!.id)
     sendSuccess(reply, post)
   })
 
@@ -83,13 +87,17 @@ export async function postRoutes(fastify: FastifyInstance): Promise<void> {
         properties: {
           title: { type: 'string', minLength: 1, maxLength: 200 },
           content: { type: 'string', minLength: 1 },
-          category: { type: 'string', enum: Object.values(Category) },
+          category: { type: 'string' },
           tags: { type: 'array', maxItems: 5, items: { type: 'string', maxLength: 20 } },
         },
       },
     },
   }, async (request, reply) => {
     const user = requireUser(request)
+    // 禁言用户禁止发帖（可正常登录与浏览）
+    if (user.status === UserStatus.MUTED) {
+      throw new ForbiddenError('您已被禁言，无法发帖', ErrorCode.ACCOUNT_MUTED)
+    }
     const body = request.body as {
       title: string
       content: string
