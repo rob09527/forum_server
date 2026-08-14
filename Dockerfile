@@ -5,7 +5,7 @@
 # ============================================================
 
 # ---- 构建阶段 ----
-FROM node:20-alpine AS build
+FROM node:22-alpine AS build
 WORKDIR /app
 
 # 时区 + 原生模块编译兜底（argon2 无 musl 预编译时走 node-gyp）
@@ -27,7 +27,7 @@ COPY . .
 RUN DATABASE_URL="postgresql://placeholder:placeholder@localhost:5432/placeholder" npx prisma generate && pnpm run build
 
 # ---- 运行阶段 ----
-FROM node:20-alpine
+FROM node:22-alpine
 WORKDIR /app
 ENV NODE_ENV=production
 RUN apk add --no-cache tzdata
