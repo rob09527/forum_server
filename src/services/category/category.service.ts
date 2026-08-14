@@ -722,9 +722,9 @@ const TAGS = [
   'Agent评测CN', '工具调用评测', '代码评测CN',
 ]
 
-/** 获取热门标签列表 */
+/** 获取热门标签列表（过滤掉超过 20 字符的标签，避免与发帖 schema 的 maxLength 冲突） */
 export function listTags(): string[] {
-  return TAGS
+  return TAGS.filter((t) => t.length <= 20)
 }
 
 /**
