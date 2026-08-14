@@ -148,10 +148,11 @@ async function checkRateLimit(userId: number): Promise<void> {
 
 /**
  * 从 Markdown content 中提取引用的本地图片相对路径。
- * 匹配 ![](/uploads/...)，排除外部 URL。
+ * 同时兼容：相对路径 ![](/uploads/...) 与历史绝对 URL ![](https://host/uploads/...)
+ * （后者取 /uploads/ 段，用于清理此前误存完整 URL 的孤儿文件）。
  */
 export function extractImagePaths(content: string): string[] {
-  const regex = /!\[[^\]]*\]\((\/uploads\/[^)\s]+)\)/g
+  const regex = /!\[[^\]]*\]\((?:https?:\/\/[^)\s]*)?(\/uploads\/[^)\s]+)\)/g
   const paths: string[] = []
   let match: RegExpExecArray | null
   while ((match = regex.exec(content)) !== null) {

@@ -78,8 +78,8 @@ fastify.setNotFoundHandler((_request, reply) => {
   })
 })
 
-// 允许的浏览器源（CORS 与 CSRF 共用）；生产环境需替换为真实域名
-const ALLOWED_ORIGINS = ['http://localhost:3000']
+// 允许的浏览器源（CORS 与 CSRF 共用）；逗号分隔多域名，本地/测试/生产各自配置
+const ALLOWED_ORIGINS = config.ALLOWED_ORIGINS.split(',').map((s) => s.trim())
 
 // --- Plugins ---
 await fastify.register(cors, {
@@ -93,11 +93,11 @@ fastify.addHook('onRequest', csrfGuard(ALLOWED_ORIGINS))
 
 await fastify.register(cookie)
 
-// 全局限流：默认每 IP 每分钟 100 次。认证端点（login/register/telegram）在路由内按需收紧到 5 次。
+// 全局限流：默认每 IP 每分钟 600 次。认证端点（login/register/telegram）在路由内按需收紧到 5 次。
 // errorResponseBuilder 统一错误格式，避免破坏前端 extractErrorMessage 的解析。
 await fastify.register(rateLimit, {
   global: true,
-  max: 100,
+  max: 600,
   timeWindow: '1 minute',
   // errorResponseBuilder 必须「throw」一个带 statusCode + code 的错误对象，
   // 走全局 errorHandler 的 AppError 分支统一格式化（若返回 body 会被当 500 处理）。
@@ -141,8 +141,10 @@ fastify.get('/api/health', async (_request, reply) => {
   sendSuccess(reply, { status: 'ok', timestamp: new Date().toISOString() })
 })
 
-// --- TG Login 测试页（仅开发环境使用） ---
-fastify.get('/test-tg', async (_request, reply) => {
-  const html = await readFile('../docs/scripts/test-tg-login.html', 'utf-8')
-  reply.type('text/html').send(html)
-})
+// --- TG Login 测试页（仅非生产环境使用，生产不暴露含 ngrok 地址的调试页） ---
+if (config.NODE_ENV !== 'production') {
+  fastify.get('/test-tg', async (_request, reply) => {
+    const html = await readFile('../docs/scripts/test-tg-login.html', 'utf-8')
+    reply.type('text/html').send(html)
+  })
+}

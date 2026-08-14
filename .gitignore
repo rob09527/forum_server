@@ -4,3 +4,7 @@ dist/
 
 # 运行时日志
 logs/
+
+# 上传的图片是运行时数据，不入库（保留 .gitkeep 占位）
+public/uploads/*
+!public/uploads/.gitkeep
