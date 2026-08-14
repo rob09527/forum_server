@@ -14,8 +14,9 @@ RUN apk add --no-cache python3 make g++ tzdata
 ENV TZ=Asia/Shanghai
 
 # 项目用 pnpm（pnpm-workspace.yaml 的 allowBuilds 控制原生依赖构建）
-# 切华为云源（实测比 npmmirror 快约 10 倍，且稳定）
-RUN npm config set registry https://mirrors.huaweicloud.com/repository/npm/
+# 默认切华为云源（本机国内构建快）；CI 用 --build-arg NPM_REGISTRY 覆盖为官方源
+ARG NPM_REGISTRY=https://mirrors.huaweicloud.com/repository/npm/
+RUN npm config set registry ${NPM_REGISTRY}
 RUN npm install -g pnpm@11
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
