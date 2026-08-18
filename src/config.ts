@@ -46,6 +46,12 @@ const envSchema = z.object({
 
   /** 帖子正文最少字符数，防止水帖，默认 10 */
   POST_MIN_CONTENT_LENGTH: z.coerce.number().int().positive().default(10),
+
+  // ── 搜索（Meilisearch） ──
+  /** Meilisearch 地址，本地 dev 用 Homebrew 原生实例，生产填 compose 内服务名 */
+  MEILI_HOST: z.string().default('http://localhost:7700'),
+  /** Meilisearch master key；本地 dev 无 key 留空，生产必填（compose 注入） */
+  MEILI_MASTER_KEY: z.string().default(''),
 })
 
 const parsed = envSchema.safeParse(process.env)

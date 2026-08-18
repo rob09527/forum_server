@@ -11,6 +11,12 @@ import { redis, RedisKey } from '../../lib/redis.js'
 import { cleanPostImages, extractImagePaths } from '../upload/upload.service.js'
 import { earnPoints } from '../points/points.service.js'
 import type { UserPublic } from '../auth/auth.service.js'
+import { toListItem } from './post-formatter.js'
+import type { PostListItem } from './post-formatter.js'
+import { indexPost, removePost } from '../search/search.service.js'
+
+// 对外保持 post.service 仍是 PostListItem 的出口（引用处无需改动）
+export type { PostListItem } from './post-formatter.js'
 
 /** 帖子创建请求 */
 export interface CreatePostInput {
@@ -48,43 +54,6 @@ export interface PostListQuery {
   page?: number
   /** 每页条数，最大 50，默认 20 */
   pageSize?: number
-}
-
-/** 帖子列表项（不含正文 content） */
-export interface PostListItem {
-  /** 帖子 ID */
-  id: number
-  /** 标题 */
-  title: string
-  /** 所属板块 */
-  category: string
-  /** 标签列表 */
-  tags: string[]
-  /** 作者摘要 */
-  author: {
-    /** 作者 ID */
-    id: number
-    /** 用户名 */
-    username: string
-    /** 头像 URL，null 时前端用默认头像 */
-    avatar: string | null
-    /** 用户等级：claw | leg | meat */
-    level: string
-  }
-  /** 浏览量 */
-  viewCount: number
-  /** 点赞数 */
-  likeCount: number
-  /** 评论数 */
-  commentCount: number
-  /** 是否置顶 */
-  isPinned: boolean
-  /** 最后回复用户，MVP 无评论系统前为 null */
-  lastReplyUser: string | null
-  /** 最后回复时间，MVP 无评论系统前为 null */
-  lastReplyTime: string | null
-  /** 发布时间，ISO 8601 */
-  createdAt: string
 }
 
 /** 帖子详情（含正文 content） */
@@ -165,7 +134,7 @@ export async function createPost(input: CreatePostInput, authorId: number): Prom
   }
 
   // 「建帖 → 发帖数 +1 → 发分」原子化，避免帖子存在但计数/积分没落库的脏数据
-  return prisma.$transaction(async (tx) => {
+  const { post, result } = await prisma.$transaction(async (tx) => {
     const post = await tx.post.create({
       data: {
         title: trimmedTitle,
@@ -190,13 +159,21 @@ export async function createPost(input: CreatePostInput, authorId: number): Prom
     // [R1] 发帖 +10 鸡腿，当日最多 3 帖有分，超限静默跳过
     const result = await earnPoints(authorId, PointType.POST, { refId: post.id }, tx)
 
-    const detail = toDetail(post)
-    // 升级即时生效：返回给前端的作者等级覆盖为升级后的值 [R22]
-    if (result.earned > 0 && result.level) {
-      detail.author.level = result.level
-    }
-    return detail
+    return { post, result }
   })
+
+  const detail = toDetail(post)
+  // 升级即时生效：返回给前端的作者等级覆盖为升级后的值 [R22]
+  if (result.earned > 0 && result.level) {
+    detail.author.level = result.level
+  }
+
+  // 同步搜索索引（fire-and-forget：索引是派生数据，失败不阻塞发帖，可 reindexAll 修复）
+  indexPost(post).catch((err) => {
+    console.error('[search] index post failed:', err)
+  })
+
+  return detail
 }
 
 /**
@@ -392,6 +369,11 @@ export async function updatePost(id: number, input: UpdatePostInput, userId: num
     },
   })
 
+  // 同步搜索索引（fire-and-forget，编辑后的标题/正文/标签变更立即生效于搜索）
+  indexPost(post).catch((err) => {
+    console.error('[search] index post failed:', err)
+  })
+
   return toDetail(post)
 }
 
@@ -421,6 +403,11 @@ async function performDelete(id: number): Promise<void> {
 
   // 清理引用的本地图片（unlink 失败只记日志，不影响主流程）
   await cleanPostImages(existing.authorId, imagePaths)
+
+  // 同步删除搜索索引（fire-and-forget）
+  removePost(id).catch((err) => {
+    console.error('[search] remove post failed:', err)
+  })
 }
 
 /**
@@ -465,41 +452,6 @@ export async function getHotPosts(limit = 10): Promise<HotPost[]> {
       category: p.category,
       heatScore: heatScore(p),
     }))
-}
-
-/** 将 Prisma Post（含 author）转为列表项 */
-function toListItem(post: {
-  id: number
-  title: string
-  category: string
-  tags: string[]
-  author: { id: number; username: string; avatar: string | null; level: string }
-  viewCount: number
-  likeCount: number
-  commentCount: number
-  isPinned: boolean
-  createdAt: Date
-  updatedAt: Date
-}): PostListItem {
-  return {
-    id: post.id,
-    title: post.title,
-    category: post.category,
-    tags: post.tags,
-    author: {
-      id: post.author.id,
-      username: post.author.username,
-      avatar: post.author.avatar,
-      level: post.author.level,
-    },
-    viewCount: post.viewCount,
-    likeCount: post.likeCount,
-    commentCount: post.commentCount,
-    isPinned: post.isPinned,
-    lastReplyUser: null,
-    lastReplyTime: null,
-    createdAt: post.createdAt.toISOString(),
-  }
 }
 
 /** 将 Prisma Post（含 content + author）转为详情 */
