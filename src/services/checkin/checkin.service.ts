@@ -5,6 +5,8 @@ import { PointType } from '../../constants/business.js'
 import { ConflictError } from '../../utils/errors.js'
 import { ErrorCode } from '../../constants/error-codes.js'
 import { earnPoints, formatDateKey } from '../points/points.service.js'
+import { getCheckinConfig } from '../config/config.service.js'
+import type { CheckinConfig } from '../config/config.service.js'
 
 /**
  * 签到服务。
@@ -46,12 +48,14 @@ export interface CheckinResult {
 }
 
 /**
- * 计算第 streak 天签到应得的鸡腿。
- * [R10] 5 + [R11] min(streak, 5) + [R12] 连续满 7 天再 +30
- * 例：第 7 天 = 5 + 5 + 30 = 40
+ * 计算第 streak 天签到应得的鸡腿，参数来自后台配置（config.service.getCheckinConfig）。
+ * [R10] base + [R11] min(streak × streakBonusPerDay, streakBonusCap) + [R12] 连续每满 milestoneEvery 天再 +milestoneBonus
+ * 默认值下第 7 天 = 5 + min(7×1, 5) + 30 = 5 + 5 + 30 = 40
  */
-function computeCheckinPoints(streak: number): number {
-  return 5 + Math.min(streak, 5) + (streak % 7 === 0 ? 30 : 0)
+function computeCheckinPoints(streak: number, cfg: CheckinConfig): number {
+  const streakBonus = Math.min(streak * cfg.streakBonusPerDay, cfg.streakBonusCap)
+  const milestoneBonus = streak > 0 && streak % cfg.milestoneEvery === 0 ? cfg.milestoneBonus : 0
+  return cfg.base + streakBonus + milestoneBonus
 }
 
 /**
@@ -88,7 +92,8 @@ export async function checkin(userId: number): Promise<CheckinResult> {
       ? user.checkinStreak + 1
       : 1
 
-  const delta = computeCheckinPoints(streak)
+  const cfg = await getCheckinConfig()
+  const delta = computeCheckinPoints(streak, cfg)
 
   // 发分（points + totalPointsEarned + 升级 + 写流水），[R4] 走统一积分通道
   await earnPoints(userId, PointType.CHECKIN, { delta })
@@ -129,17 +134,19 @@ export async function checkinStatus(userId: number, month?: string): Promise<Che
 
   const checkedToday = !!user.lastCheckinAt && formatDateKey(user.lastCheckinAt) === today
 
+  const cfg = await getCheckinConfig()
+
   // 今天预计可得：已签 → 用当前 streak 算今天所得；未签 → 算下一次签到后的 streak
   let todayDelta: number
   if (checkedToday) {
-    todayDelta = computeCheckinPoints(user.checkinStreak)
+    todayDelta = computeCheckinPoints(user.checkinStreak, cfg)
   } else {
     const yesterday = formatDateKey(new Date(now.getTime() - 24 * 3600 * 1000))
     const nextStreak =
       user.lastCheckinAt && formatDateKey(user.lastCheckinAt) === yesterday
         ? user.checkinStreak + 1
         : 1
-    todayDelta = computeCheckinPoints(nextStreak)
+    todayDelta = computeCheckinPoints(nextStreak, cfg)
   }
 
   // 月份解析：缺省当前月；非法则抛参数错误（路由层已做格式校验，这里只兜底）

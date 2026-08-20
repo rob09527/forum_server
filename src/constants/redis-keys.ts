@@ -49,4 +49,16 @@ export const RedisKey = {
   // ── 限流 ──
   /** API 限流计数 */
   rateLimit: (ip: string, endpoint: string) => `rate:${ip}:${endpoint}` as const,
+
+  // ── 游戏化配置 ──
+  /**
+   * 签到奖励配置（JSON 字符串），由 admin 后端直写共享 Redis，forum 只读 + 默认兜底。
+   * 未配置/非法时用 config.service 的 DEFAULT_CHECKIN_CONFIG。
+   */
+  configCheckin: 'config:checkin',
+  /**
+   * 等级配置（JSON 数组字符串），由 admin 后端直写共享 Redis，forum 只读 + 默认兜底。
+   * 未配置/非法时用 config.service 的 DEFAULT_LEVELS。
+   */
+  configLevels: 'config:levels',
 } as const

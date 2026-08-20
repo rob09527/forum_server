@@ -3,6 +3,8 @@ import { prisma } from '../../lib/prisma.js'
 import { redis } from '../../lib/redis.js'
 import { RedisKey } from '../../constants/redis-keys.js'
 import { PointType, UserLevel } from '../../constants/business.js'
+import { getLevels } from '../config/config.service.js'
+import type { LevelConfig } from '../config/config.service.js'
 
 /**
  * 积分服务。
@@ -29,13 +31,6 @@ const POINT_RULES: Record<PointTypeValue, { delta: number; dailyTimes?: number }
   [PointType.COMMENT]: { delta: 3, dailyTimes: 10 },
   [PointType.LIKED]: { delta: 1 },
 }
-
-/** 等级门槛 [R21]：按累计鸡腿升档，从上到下匹配（越靠前门槛越高） */
-const LEVEL_THRESHOLDS: { level: string; minTotal: number }[] = [
-  { level: UserLevel.MEAT, minTotal: 500 },
-  { level: UserLevel.LEG, minTotal: 100 },
-  { level: UserLevel.CLAW, minTotal: 0 },
-]
 
 /** 积分发放结果 */
 export interface EarnResult {
@@ -83,6 +78,11 @@ export async function earnPoints(
     }
   }
 
+  // 等级配置从 Redis 读（后台可控），在事务外取一次：
+  // - 放在当日上限拦截之后，被拦截的路径（上面已 return）不会多一次 GET
+  // - 不放进 apply 事务回调，避免在持有数据库事务连接期间做 Redis 往返
+  const levels = await getLevels()
+
   // 「加分 → 升级 → 写流水」三段写必须原子：要么全成功，要么全回滚，
   // 避免出现「鸡腿加了但没流水」或「流水写了但等级没升」的对账缺口。
   // 传入 tx 时复用调用方事务；否则自建一个事务。
@@ -98,7 +98,7 @@ export async function earnPoints(
     })
 
     // [R22] 升级：按累计值判定，只升不降（永不降级）
-    const newLevel = levelForTotal(updated.totalPointsEarned)
+    const newLevel = levelForTotal(updated.totalPointsEarned, levels)
     if (newLevel !== updated.level) {
       await db.user.update({ where: { id: userId }, data: { level: newLevel } })
     }
@@ -114,12 +114,15 @@ export async function earnPoints(
   return tx ? apply(tx) : prisma.$transaction(apply)
 }
 
-/** 按累计鸡腿判定等级 [R21]，levelForTotal 独立导出供注册等场景直接算等级 */
-export function levelForTotal(total: number): string {
-  for (const t of LEVEL_THRESHOLDS) {
-    if (total >= t.minTotal) return t.level
+/**
+ * 按累计鸡腿判定等级 [R21]，等级门槛来自后台配置（config.service.getLevels）。
+ * 兜底：所有门槛都不满足（理论不出现，配置已保证有 minTotal=0 的起始等级）时返回最低等级 key。
+ */
+export function levelForTotal(total: number, levels: LevelConfig[]): string {
+  for (const t of levels) {
+    if (total >= t.minTotal) return t.key
   }
-  return UserLevel.CLAW
+  return levels[levels.length - 1]?.key ?? UserLevel.CLAW
 }
 
 /** 等级进度（用户资料页进度条用）：当前等级 + 下一门槛 + 还差多少 */
@@ -132,14 +135,14 @@ export interface LevelProgress {
   remaining: number
 }
 
-/** 按累计鸡腿算等级进度 [R21]，门槛规则只此一处（LEVEL_THRESHOLDS） */
-export function levelProgress(total: number): LevelProgress {
-  const ascending = [...LEVEL_THRESHOLDS].reverse() // claw → leg → meat
-  let level = ascending[0].level
+/** 按累计鸡腿算等级进度 [R21]，门槛规则来自后台配置（config.service.getLevels） */
+export function levelProgress(total: number, levels: LevelConfig[]): LevelProgress {
+  const ascending = [...levels].reverse() // 最低 → 最高（claw → leg → meat）
+  let level = ascending[0]?.key ?? UserLevel.CLAW
   let nextLevelAt: number | null = null
   for (const t of ascending) {
     if (total >= t.minTotal) {
-      level = t.level
+      level = t.key
     } else {
       nextLevelAt = t.minTotal
       break

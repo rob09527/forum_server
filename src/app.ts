@@ -22,6 +22,7 @@ import { checkinRoutes } from './routes/checkin.routes.js'
 import { userRoutes } from './routes/user.routes.js'
 import { adminRoutes } from './routes/admin.routes.js'
 import { searchRoutes } from './routes/search.routes.js'
+import { configRoutes } from './routes/config.routes.js'
 import { sendSuccess } from './utils/response.js'
 
 export const fastify = Fastify({ logger: true })
@@ -134,6 +135,7 @@ await fastify.register(checkinRoutes)
 await fastify.register(userRoutes)
 await fastify.register(adminRoutes)
 await fastify.register(searchRoutes)
+await fastify.register(configRoutes)
 
 // [规范例外] health check 和 /test-tg 的查询/读文件逻辑直接写在这里，
 // 因为没有对应的 service，为 3 行逻辑新建 service 文件反而过度

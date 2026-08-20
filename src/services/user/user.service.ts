@@ -3,6 +3,7 @@ import { ErrorCode } from '../../constants/error-codes.js'
 import { NotFoundError, ValidationError, ForbiddenError } from '../../utils/errors.js'
 import { levelProgress } from '../points/points.service.js'
 import type { LevelProgress } from '../points/points.service.js'
+import { getLevels } from '../config/config.service.js'
 import { ALLOWED_AVATAR_STYLES, AVATARS_PER_STYLE } from '../../constants/business.js'
 import type { UserStatusType } from '../../constants/business.js'
 import type { UserPublic } from '../auth/auth.service.js'
@@ -119,8 +120,9 @@ export async function getUserProfile(userId: number, viewerId?: number): Promise
     throw new NotFoundError('用户', ErrorCode.NOT_FOUND)
   }
 
-  // 等级以累计鸡腿实时计算为准（[R20][R21]），不信任可能过期的 DB 冗余字段
-  const progress = levelProgress(user.totalPointsEarned)
+  // 等级以累计鸡腿实时计算为准（[R20][R21]），不信任可能过期的 DB 冗余字段；
+  // 门槛来自后台配置（Redis，未配置走默认值），传 levels 计算
+  const progress = levelProgress(user.totalPointsEarned, await getLevels())
 
   return {
     id: user.id,
