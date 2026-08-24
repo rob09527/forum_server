@@ -167,3 +167,31 @@ export const OAuthProvider = {
   TELEGRAM: 'telegram',
 } as const
 export type OAuthProviderType = (typeof OAuthProvider)[keyof typeof OAuthProvider]
+
+/** 站内通知类型 */
+export const NotificationType = {
+  /** 有人评论我的帖子（顶层评论） */
+  COMMENT: 'comment',
+  /** 有人回复我的评论（楼中楼） */
+  REPLY: 'reply',
+  /** 有人赞我的帖子/评论（同一目标聚合为一条） */
+  LIKE: 'like',
+  /** 有人关注我 */
+  FOLLOW: 'follow',
+  /** 系统通知（后台群发） */
+  SYSTEM: 'system',
+  /** 帖子/评论中 @ 提到了我（编辑器点选插入的结构化 mention） */
+  MENTION: 'mention',
+} as const
+export type NotificationTypeType = (typeof NotificationType)[keyof typeof NotificationType]
+
+/** 后台系统通知的群发目标 */
+export const SystemNotifyTarget = {
+  /** 全部 active 用户 */
+  ALL: 'all',
+  /** 按角色筛选 */
+  ROLE: 'role',
+  /** 指定用户 ID 列表 */
+  USERS: 'users',
+} as const
+export type SystemNotifyTargetType = (typeof SystemNotifyTarget)[keyof typeof SystemNotifyTarget]

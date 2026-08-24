@@ -91,6 +91,24 @@ model User {
   /// 用户的评论点赞记录
   commentLikes  CommentLike[]
 
+  /// 粉丝数（冗余，关注/取关时同步增减，避免 COUNT）
+  followerCount  Int           @default(0)
+
+  /// 关注数（冗余）
+  followingCount Int           @default(0)
+
+  /// 用户的收藏记录
+  bookmarks      Bookmark[]
+
+  /// 关注关系（用户主动关注的人）
+  following      Follow[]      @relation("Follows")
+
+  /// 关注关系（关注该用户的人）
+  followers      Follow[]      @relation("Followers")
+
+  /// 用户的通知
+  notifications  Notification[]
+
   @@index([status])
   @@map("users")
 }
@@ -127,6 +145,9 @@ model Post {
   /// 评论数（冗余字段，发评论时更新）
   commentCount Int       @default(0)
 
+  /// 热度分（物化列：likeCount*300 + commentCount*200 + viewCount，点赞/评论/浏览写路径增量维护）
+  heatScore    Int       @default(0)
+
   /// 是否置顶，置顶帖列表优先展示（admin 模块后续提供置顶 API）
   isPinned     Boolean   @default(false)
 
@@ -142,10 +163,19 @@ model Post {
   /// 帖子的点赞记录
   likes        PostLike[]
 
+  /// 帖子的收藏记录
+  bookmarks    Bookmark[]
+
   @@index([category, createdAt(sort: Desc)])
   @@index([authorId])
   @@index([createdAt])
   @@index([tags], type: Gin) // 标签筛选 GIN 索引，tags: { has: tag } 查询依赖
+  // 置顶优先 + 时间倒序（latest 首页/板块列表），让 orderBy([isPinned, createdAt]) 走索引
+  @@index([isPinned, createdAt(sort: Desc)])
+  @@index([category, isPinned, createdAt(sort: Desc)])
+  // 热度窗口扫描：索引服务 hot 列表的 WHERE createdAt >= 7d 范围过滤；排序首键 isPinned 无法并入本索引，
+  // 残余 isPinned+heatScore 排序为有界窗口内小集合显式排序（可接受，已消除全量拉回内存 JS 排序）
+  @@index([createdAt, heatScore(sort: Desc)])
   @@map("posts")
 }
 
@@ -374,4 +404,120 @@ model Advert {
 
   @@index([position, isActive, sortOrder(sort: Desc)])
   @@map("adverts")
+}
+
+/// 帖子收藏（私密，仅本人可见）
+model Bookmark {
+  /// 收藏记录 ID
+  id        Int      @id @default(autoincrement())
+
+  /// 收藏用户 ID
+  userId    Int
+
+  /// 收藏用户
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// 被收藏的帖子 ID，帖子删除时级联删除收藏记录
+  postId    Int
+
+  /// 被收藏的帖子
+  post      Post     @relation(fields: [postId], references: [id], onDelete: Cascade)
+
+  /// 收藏时间
+  createdAt DateTime @default(now())
+
+  /// 同一用户对同一帖子只能收藏一次
+  @@unique([userId, postId])
+  @@index([postId])
+  @@map("bookmarks")
+}
+
+/// 关注关系（单向 follow：follower 关注 followee，Twitter 式非双向好友）
+model Follow {
+  /// 关注记录 ID
+  id         Int      @id @default(autoincrement())
+
+  /// 关注者 ID（主动关注的一方）
+  followerId Int
+
+  /// 关注者
+  follower   User     @relation("Follows", fields: [followerId], references: [id], onDelete: Cascade)
+
+  /// 被关注者 ID
+  followeeId Int
+
+  /// 被关注者
+  followee   User     @relation("Followers", fields: [followeeId], references: [id], onDelete: Cascade)
+
+  /// 关注时间
+  createdAt  DateTime @default(now())
+
+  /// 同一用户对同一目标只能关注一次
+  @@unique([followerId, followeeId])
+  @@index([followeeId])
+  @@map("follows")
+}
+
+/// 站内通知
+model Notification {
+  /// 通知 ID
+  id        Int      @id @default(autoincrement())
+
+  /// 接收者 ID
+  userId    Int
+
+  /// 接收者
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// 通知类型：comment(评论我的帖子) | reply(回复我的评论) | like(被点赞，聚合) | follow(被关注) | system(系统通知)
+  type      String
+
+  /// 触发者 ID 列表，只保留最近 3 个（防无界数组 + 整列重写）；总数见 actorCount
+  actorIds  Int[]
+
+  /// 触发者总数（聚合通知的累计事件数，like/follow 因唯一约束等于不同人数；comment 为评论次数近似）
+  actorCount Int    @default(0)
+
+  /// 关联帖子 ID（comment/reply/like-post 用；system 可选跳转；帖子删除后跳转会失效，前端兜底）
+  postId    Int?
+
+  /// 关联评论 ID（reply/like-comment 用）
+  commentId Int?
+
+  /// 群发消息 ID（system 通知指向 notification_messages 表，正文不逐行冗余；其余类型为 null）
+  messageId Int?
+
+  /// 通知正文（system 通知用；comment/reply/like 由关联对象推导，可空）
+  /// 新群发不再逐行写正文，由 messageId 指向 notification_messages；存量行仍用本列兜底
+  content   String?
+
+  /// 是否已读
+  isRead    Boolean  @default(false)
+
+  /// 通知时间
+  createdAt DateTime @default(now())
+
+  @@index([userId, isRead, createdAt(sort: Desc)])
+  @@index([messageId])
+  @@map("notifications")
+}
+
+/// 系统通知群发正文（广播时正文只存一份，通知行通过 messageId 引用，避免逐用户冗余存储）
+model NotificationMessage {
+  /// 消息 ID
+  id        Int      @id @default(autoincrement())
+
+  /// 通知正文
+  content   String   @db.Text
+
+  /// 跳转帖子 ID（可选）
+  postId    Int?
+
+  /// 实际送达用户数
+  sentCount Int      @default(0)
+
+  /// 创建时间
+  createdAt DateTime @default(now())
+
+  @@map("notification_messages")
 }

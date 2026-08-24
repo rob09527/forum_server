@@ -1,8 +1,9 @@
 import { prisma } from '../../lib/prisma.js'
 import { ErrorCode } from '../../constants/error-codes.js'
 import { NotFoundError, ForbiddenError, ValidationError } from '../../utils/errors.js'
-import { PointType, UserRole } from '../../constants/business.js'
+import { PointType, UserRole, NotificationType } from '../../constants/business.js'
 import { earnPoints } from '../points/points.service.js'
+import { createAndPush, notifyMentions } from '../notification/notification.service.js'
 import type { UserPublic } from '../auth/auth.service.js'
 
 /** 评论创建请求 */
@@ -72,26 +73,33 @@ export async function createComment(
     throw new ValidationError('评论内容不能为空', ErrorCode.COMMENT_CONTENT_TOO_SHORT)
   }
 
-  // 帖子必须存在
-  const post = await prisma.post.findUnique({ where: { id: postId }, select: { id: true } })
+  // 帖子必须存在（顺带取 authorId，供事务提交后发「评论了我的帖子」通知）
+  const post = await prisma.post.findUnique({
+    where: { id: postId },
+    select: { id: true, authorId: true },
+  })
   if (!post) {
     throw new NotFoundError('帖子', ErrorCode.POST_NOT_FOUND)
+  }
+
+  // 楼中楼回复：事务前校验 parent 存在且属于同一帖子（顺带取 authorId，供发「回复了我的评论」通知）
+  let parent: { id: number; postId: number; authorId: number } | null = null
+  if (input.parentId) {
+    parent = await prisma.comment.findUnique({
+      where: { id: input.parentId },
+      select: { id: true, postId: true, authorId: true },
+    })
+    if (!parent) {
+      throw new NotFoundError('评论', ErrorCode.COMMENT_NOT_FOUND)
+    }
+    if (parent.postId !== postId) {
+      throw new ValidationError('回复的评论不属于该帖子', ErrorCode.COMMENT_PARENT_MISMATCH)
+    }
   }
 
   // 「发评论 → 计数/发分」原子化（顶层含楼层锁）。两分支返回同一形状 { comment, result }
   const { comment, result } = input.parentId
     ? await prisma.$transaction(async (tx) => {
-        // 楼中楼回复：校验 parent 存在且属于同一帖子
-        const parent = await tx.comment.findUnique({
-          where: { id: input.parentId! },
-          select: { id: true, postId: true },
-        })
-        if (!parent) {
-          throw new NotFoundError('评论', ErrorCode.COMMENT_NOT_FOUND)
-        }
-        if (parent.postId !== postId) {
-          throw new ValidationError('回复的评论不属于该帖子', ErrorCode.COMMENT_PARENT_MISMATCH)
-        }
         // 楼中楼回复不分配楼层号（floor=null），父楼层的归属靠 parentId 表达。
         // 若存 parent.floor，会与 @@unique([postId, floor]) 冲突（多回复同一楼层时唯一约束报错）
         const created = await tx.comment.create({
@@ -121,11 +129,12 @@ export async function createComment(
           },
         })
 
-        // 顶层评论计入评论总数：post.commentCount +1、user.commentCount +1，同事务避免脏数据
+        // 顶层评论计入评论总数：post.commentCount +1、user.commentCount +1，同事务避免脏数据；
+        // 热度分 +200（heatScore = likeCount*300 + commentCount*200 + viewCount）
         await Promise.all([
           tx.post.update({
             where: { id: postId },
-            data: { commentCount: { increment: 1 } },
+            data: { commentCount: { increment: 1 }, heatScore: { increment: 200 } },
           }),
           tx.user.update({
             where: { id: authorId },
@@ -136,6 +145,36 @@ export async function createComment(
         const res = await earnPoints(authorId, PointType.COMMENT, { refId: created.id }, tx)
         return { comment: created, result: res }
       })
+
+  // 通知触发（fire-and-forget，非关键路径失败不阻塞；排除自己评论/回复自己）
+  if (input.parentId && parent && parent.authorId !== authorId) {
+    // 楼中楼回复 → 通知被回复评论的作者
+    createAndPush({
+      userId: parent.authorId,
+      type: NotificationType.REPLY,
+      actorId: authorId,
+      postId,
+      commentId: parent.id,
+    })
+  } else if (!input.parentId && post.authorId !== authorId) {
+    // 顶层评论 → 通知帖子作者
+    createAndPush({
+      userId: post.authorId,
+      type: NotificationType.COMMENT,
+      actorId: authorId,
+      postId,
+    })
+  }
+
+  // @提及通知（fire-and-forget）：排除自己（notifyMentions 内处理）、
+  // 帖子作者（已收 COMMENT）、被回复者（已收 REPLY），避免同一评论通知同一人两条
+  notifyMentions({
+    content,
+    actorId: authorId,
+    postId,
+    commentId: comment.id,
+    excludeIds: [post.authorId, ...(parent ? [parent.authorId] : [])],
+  })
 
   const item = toItem(comment)
   // 升级即时生效：返回给前端的作者等级覆盖为升级后的值 [R22]
@@ -269,11 +308,11 @@ export async function deleteComment(id: number, user: UserPublic): Promise<void>
   await prisma.$transaction(async (tx) => {
     await tx.comment.delete({ where: { id } })
 
-    // 顶层评论被删 → 帖子评论数 -1
+    // 顶层评论被删 → 帖子评论数 -1、热度分 -200（对齐 createComment 的 +200）
     if (!existing.parentId) {
       await tx.post.update({
         where: { id: existing.postId },
-        data: { commentCount: { decrement: 1 } },
+        data: { commentCount: { decrement: 1 }, heatScore: { decrement: 200 } },
       })
     }
   })

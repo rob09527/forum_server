@@ -4,7 +4,7 @@ import { NotFoundError, ValidationError, ForbiddenError } from '../../utils/erro
 import { levelProgress } from '../points/points.service.js'
 import type { LevelProgress } from '../points/points.service.js'
 import { getLevels } from '../config/config.service.js'
-import { ALLOWED_AVATAR_STYLES, AVATARS_PER_STYLE } from '../../constants/business.js'
+import { ALLOWED_AVATAR_STYLES, AVATARS_PER_STYLE, UserStatus } from '../../constants/business.js'
 import type { UserStatusType } from '../../constants/business.js'
 import type { UserPublic } from '../auth/auth.service.js'
 
@@ -35,6 +35,12 @@ export interface UserProfile {
   postCount: number
   /** 评论数（冗余字段） */
   commentCount: number
+  /** 粉丝数（冗余字段） */
+  followerCount: number
+  /** 关注数（冗余字段） */
+  followingCount: number
+  /** 当前登录用户是否已关注该用户（viewerId 未登录或为自己时为 false） */
+  isFollowing: boolean
   /** 注册时间，ISO 8601 */
   createdAt: string
   /** 等级进度：下一等级门槛 + 还差多少 [R21] */
@@ -98,6 +104,49 @@ export async function getLatestUsers(limit = 8): Promise<NewUserItem[]> {
   }))
 }
 
+/** 用户搜索项（@提及候选下拉用） */
+export interface UserSearchItem {
+  /** 用户 ID */
+  id: number
+  /** 用户名 */
+  username: string
+  /** 头像 URL，null 时前端用默认头像 */
+  avatar: string | null
+  /** 用户等级 */
+  level: string
+}
+
+/** @提及候选单次最多返回条数 */
+const MENTION_SEARCH_LIMIT = 20
+
+/**
+ * 按用户名前缀搜索 active 用户（@提及候选）。
+ * 前缀匹配 + 大小写不敏感（ILIKE 'q%'）：当前用户量级下走全表扫描足够快；
+ * 若用户量增长到扫描吃力，再给 username 建 pg_trgm GIN 索引支持中缀模糊（届时需迁移）。
+ */
+export async function searchUsers(
+  q: string,
+  limit = MENTION_SEARCH_LIMIT,
+): Promise<UserSearchItem[]> {
+  const keyword = q?.trim() ?? ''
+  if (keyword.length === 0) {
+    return []
+  }
+
+  const take = Math.min(MENTION_SEARCH_LIMIT, Math.max(1, limit))
+  const users = await prisma.user.findMany({
+    where: {
+      username: { startsWith: keyword, mode: 'insensitive' },
+      status: UserStatus.ACTIVE,
+    },
+    orderBy: { username: 'asc' },
+    take,
+    select: { id: true, username: true, avatar: true, level: true },
+  })
+
+  return users
+}
+
 /** 查询用户公开资料。viewerId 为当前登录用户，鸡腿余额仅本人可见（陌生人返回 null）。 */
 export async function getUserProfile(userId: number, viewerId?: number): Promise<UserProfile> {
   const user = await prisma.user.findUnique({
@@ -113,6 +162,8 @@ export async function getUserProfile(userId: number, viewerId?: number): Promise
       stars: true,
       postCount: true,
       commentCount: true,
+      followerCount: true,
+      followingCount: true,
       createdAt: true,
     },
   })
@@ -123,6 +174,16 @@ export async function getUserProfile(userId: number, viewerId?: number): Promise
   // 等级以累计鸡腿实时计算为准（[R20][R21]），不信任可能过期的 DB 冗余字段；
   // 门槛来自后台配置（Redis，未配置走默认值），传 levels 计算
   const progress = levelProgress(user.totalPointsEarned, await getLevels())
+
+  // 关注态：仅当「他人视角」才查询（自己看自己不显示关注按钮，无需查库）
+  let isFollowing = false
+  if (viewerId && viewerId !== userId) {
+    const f = await prisma.follow.findUnique({
+      where: { followerId_followeeId: { followerId: viewerId, followeeId: userId } },
+      select: { id: true },
+    })
+    isFollowing = f !== null
+  }
 
   return {
     id: user.id,
@@ -135,6 +196,9 @@ export async function getUserProfile(userId: number, viewerId?: number): Promise
     stars: user.stars,
     postCount: user.postCount,
     commentCount: user.commentCount,
+    followerCount: user.followerCount,
+    followingCount: user.followingCount,
+    isFollowing,
     createdAt: user.createdAt.toISOString(),
     levelProgress: progress,
   }

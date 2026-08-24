@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify'
-import { getUserProfile, getUserPointsLog, getLatestUsers, updateAvatar } from '../services/user/user.service.js'
+import { getUserProfile, getUserPointsLog, getLatestUsers, searchUsers, updateAvatar } from '../services/user/user.service.js'
 import { authenticate } from '../middleware/auth.middleware.js'
 import { parseId } from '../utils/parse.js'
 import { sendSuccess } from '../utils/response.js'
@@ -54,6 +54,26 @@ export async function userRoutes(fastify: FastifyInstance): Promise<void> {
   }, async (request, reply) => {
     const query = request.query as { limit?: number }
     const users = await getLatestUsers(query.limit ? Number(query.limit) : 8)
+    sendSuccess(reply, users)
+  })
+
+  /**
+   * GET /api/users/search?q=前缀
+   * 按用户名前缀搜索 active 用户（@提及候选，需登录）。返回 { id, username, avatar, level }。
+   */
+  fastify.get('/api/users/search', {
+    preHandler: [authenticate],
+    schema: {
+      querystring: {
+        type: 'object',
+        properties: {
+          q: { type: 'string', minLength: 1, maxLength: 40 },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const query = request.query as { q?: string }
+    const users = await searchUsers(query.q ?? '')
     sendSuccess(reply, users)
   })
 

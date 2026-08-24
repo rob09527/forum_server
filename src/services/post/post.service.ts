@@ -10,10 +10,12 @@ import { ErrorCode } from '../../constants/error-codes.js'
 import { redis, RedisKey } from '../../lib/redis.js'
 import { cleanPostImages, extractImagePaths } from '../upload/upload.service.js'
 import { earnPoints } from '../points/points.service.js'
+import { getBookmarkedIds } from '../bookmark/bookmark.service.js'
 import type { UserPublic } from '../auth/auth.service.js'
 import { toListItem } from './post-formatter.js'
 import type { PostListItem } from './post-formatter.js'
 import { indexPost, removePost } from '../search/search.service.js'
+import { notifyMentions } from '../notification/notification.service.js'
 
 // 对外保持 post.service 仍是 PostListItem 的出口（引用处无需改动）
 export type { PostListItem } from './post-formatter.js'
@@ -88,11 +90,6 @@ export interface HotPost {
   category: string
   /** 热度分 */
   heatScore: number
-}
-
-/** 热度计算：点赞×3 + 评论×2 + 浏览/100 */
-function heatScore(post: { likeCount: number; commentCount: number; viewCount: number }): number {
-  return post.likeCount * 3 + post.commentCount * 2 + post.viewCount / 100
 }
 
 /**
@@ -173,13 +170,20 @@ export async function createPost(input: CreatePostInput, authorId: number): Prom
     console.error('[search] index post failed:', err)
   })
 
+  // @提及通知（fire-and-forget）：正文里 @ 到的人收到通知；排除作者本人
+  notifyMentions({
+    content: trimmedContent,
+    actorId: authorId,
+    postId: post.id,
+  })
+
   return detail
 }
 
 /**
  * 查询单个帖子详情。
  * 同时异步更新浏览计数（Redis SET 去重，同一用户 24h 内只计一次）。
- * viewerId 为 null 表示未登录用户，不计数（防刷）。
+ * viewerId 为 null 表示未登录用户，不计数（防刷）；登录时注入 isBookmarked。
  */
 export async function getPostById(id: number, viewerId?: number): Promise<PostDetail> {
   const post = await prisma.post.findUnique({
@@ -203,7 +207,19 @@ export async function getPostById(id: number, viewerId?: number): Promise<PostDe
     })
   }
 
-  return toDetail(post)
+  // 收藏态注入：单条查当前用户是否已收藏（仅本人可见）
+  let isBookmarked = false
+  if (viewerId) {
+    const bm = await prisma.bookmark.findUnique({
+      where: { userId_postId: { userId: viewerId, postId: post.id } },
+      select: { id: true },
+    })
+    isBookmarked = bm !== null
+  }
+
+  const detail = toDetail(post)
+  detail.isBookmarked = isBookmarked
+  return detail
 }
 
 /**
@@ -219,7 +235,7 @@ async function recordViewCount(postId: number, userId: number): Promise<void> {
     await redis.expire(viewersKey, RedisKey.postViewerTtl)
     await prisma.post.update({
       where: { id: postId },
-      data: { viewCount: { increment: 1 } },
+      data: { viewCount: { increment: 1 }, heatScore: { increment: 1 } },
     })
   }
 }
@@ -228,8 +244,12 @@ async function recordViewCount(postId: number, userId: number): Promise<void> {
  * 帖子列表查询。
  * latest：置顶优先 + 发布时间倒序
  * hot：最近 7 天 + 热度分倒序
+ * viewerId 为当前登录用户（可选登录接口），用于批量注入 isBookmarked；未登录为 undefined。
  */
-export async function listPosts(query: PostListQuery): Promise<Paginated<PostListItem>> {
+export async function listPosts(
+  query: PostListQuery,
+  viewerId?: number,
+): Promise<Paginated<PostListItem>> {
   // 页码/页大小校验：NaN、小数、负数直接抛校验错误（避免 skip: NaN 导致 500）
   const page = Number(query.page ?? 1)
   const pageSize = Number(query.pageSize ?? 20)
@@ -258,8 +278,9 @@ export async function listPosts(query: PostListQuery): Promise<Paginated<PostLis
     ...(authorId ? { authorId } : {}),
   }
 
-  // hot：最近 7 天 + 按热度分（heatScore）降序，与侧边栏热榜同一算法，不设 isHot 标记
-  // MVP 规模全量拉取后内存排序，数据量大后改 SQL 排序
+  // hot：最近 7 天 + 按物化 heatScore 降序（写路径增量维护，公式 = likeCount*300 + commentCount*200 + viewCount）。
+  // 索引 [createdAt, heatScore] 服务 7 天窗口的范围扫描；orderBy 首键是 isPinned，
+  // 残余 isPinned+heatScore 排序为有界窗口内小集合显式排序，可接受（已消除改造前的全量拉回内存 JS 排序）。
   if (sort === 'hot') {
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 3600 * 1000)
     const hotWhere = { ...where, createdAt: { gte: sevenDaysAgo } }
@@ -272,16 +293,16 @@ export async function listPosts(query: PostListQuery): Promise<Paginated<PostLis
             select: { id: true, username: true, avatar: true, level: true },
           },
         },
+        orderBy: [{ isPinned: 'desc' }, { heatScore: 'desc' }],
+        skip: (page - 1) * safePageSize,
+        take: safePageSize,
       }),
     ])
 
-    const sorted = posts.sort((a, b) => {
-      if (a.isPinned !== b.isPinned) return a.isPinned ? -1 : 1
-      return heatScore(b) - heatScore(a)
-    })
+    const bookmarkedIds = viewerId ? await getBookmarkedIds(viewerId, posts.map((p) => p.id)) : new Set<number>()
 
     return {
-      items: sorted.slice((page - 1) * safePageSize, page * safePageSize).map((p) => toListItem(p)),
+      items: posts.map((p) => toListItem(p, bookmarkedIds.has(p.id))),
       page,
       pageSize: safePageSize,
       total,
@@ -305,8 +326,10 @@ export async function listPosts(query: PostListQuery): Promise<Paginated<PostLis
     }),
   ])
 
+  const bookmarkedIds = viewerId ? await getBookmarkedIds(viewerId, posts.map((p) => p.id)) : new Set<number>()
+
   return {
-    items: posts.map((p) => toListItem(p)),
+    items: posts.map((p) => toListItem(p, bookmarkedIds.has(p.id))),
     page,
     pageSize: safePageSize,
     total,
@@ -436,22 +459,22 @@ export async function deletePostById(id: number): Promise<void> {
 
 /** 首页热门帖子 Top N（侧边栏用，不传 category 或传全部） */
 export async function getHotPosts(limit = 10): Promise<HotPost[]> {
-  // 最近 7 天，按热度分（heatScore）降序取前 N，与热门列表同一算法
+  // 最近 7 天，按物化 heatScore 降序取前 N；索引服务 7 天窗口范围扫描，残余排序为窗口内小集合显式排序
   const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 3600 * 1000)
   const posts = await prisma.post.findMany({
     where: { createdAt: { gte: sevenDaysAgo } },
-    select: { id: true, title: true, category: true, likeCount: true, commentCount: true, viewCount: true },
+    orderBy: [{ isPinned: 'desc' }, { heatScore: 'desc' }],
+    take: limit,
+    select: { id: true, title: true, category: true, heatScore: true },
   })
 
-  return posts
-    .sort((a, b) => heatScore(b) - heatScore(a))
-    .slice(0, limit)
-    .map((p) => ({
-      id: p.id,
-      title: p.title,
-      category: p.category,
-      heatScore: heatScore(p),
-    }))
+  return posts.map((p) => ({
+    id: p.id,
+    title: p.title,
+    category: p.category,
+    // 物化列存 ×100 整数，对外展示还原为与旧 heatScore() 一致的浮点值
+    heatScore: p.heatScore / 100,
+  }))
 }
 
 /** 将 Prisma Post（含 content + author）转为详情 */

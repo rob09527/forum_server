@@ -6,8 +6,10 @@ import {
   adminResetPassword,
 } from '../services/admin/admin.service.js'
 import { deletePostById } from '../services/post/post.service.js'
+import { broadcastSystemNotification } from '../services/notification/notification.service.js'
 import { requireAdminKey } from '../middleware/admin-key.middleware.js'
-import { UserRole, UserStatus } from '../constants/business.js'
+import { UserRole, UserStatus, SystemNotifyTarget } from '../constants/business.js'
+import type { SystemNotifyTargetType } from '../constants/business.js'
 import { parseId } from '../utils/parse.js'
 import { sendSuccess } from '../utils/response.js'
 
@@ -134,6 +136,49 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
       const postId = parseId(id)
       await deletePostById(postId)
       sendSuccess(reply, { id: postId })
+    },
+  )
+
+  /**
+   * POST /api/admin/notifications/broadcast
+   * 系统通知群发。Body: { target: 'all'|'role'|'users', role?, userIds?, content, postId? }
+   * 写 type=system 通知给目标用户，在线用户实时推送 SSE。
+   */
+  fastify.post(
+    '/api/admin/notifications/broadcast',
+    {
+      preHandler: [requireAdminKey],
+      schema: {
+        body: {
+          type: 'object',
+          required: ['target', 'content'],
+          properties: {
+            target: { type: 'string', enum: Object.values(SystemNotifyTarget) },
+            role: { type: 'string' },
+            userIds: { type: 'array', items: { type: 'integer', minimum: 1 } },
+            content: { type: 'string', minLength: 1, maxLength: 2000 },
+            postId: { type: ['integer', 'null'], minimum: 1 },
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const body = request.body as {
+        target: string
+        role?: string
+        userIds?: number[]
+        content: string
+        postId?: number | null
+      }
+
+      const result = await broadcastSystemNotification({
+        target: body.target as SystemNotifyTargetType,
+        role: body.role,
+        userIds: body.userIds,
+        content: body.content,
+        postId: body.postId ?? null,
+      })
+      sendSuccess(reply, result)
     },
   )
 }

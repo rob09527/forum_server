@@ -42,6 +42,10 @@ export const RedisKey = {
   /** 某日签到用户集合（SET），key 中的 date 格式为 YYYY-MM-DD，用于签到日历查询 */
   checkinDate: (date: string) => `checkin:${date}:users` as const,
 
+  // ── 通知 ──
+  /** 用户未读通知数（Redis 计数器，避免每事件 COUNT；已读时 DEL 兜底对账） */
+  unreadCount: (userId: number) => `user:${userId}:unread_count` as const,
+
   // ── 积分 ──
   /** 用户当日某类积分发放累计计数，key 中 type 为 post|comment，date 为 YYYY-MM-DD [R1/R2] */
   pointDaily: (type: string, userId: number, date: string) => `point_daily:${type}:${userId}:${date}` as const,

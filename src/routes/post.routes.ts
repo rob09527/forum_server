@@ -52,14 +52,17 @@ export async function postRoutes(fastify: FastifyInstance): Promise<void> {
       pageSize?: number
     }
 
-    const result = await listPosts({
-      category: query.category,
-      tag: query.tag,
-      authorId: query.authorId ? Number(query.authorId) : undefined,
-      sort: query.sort,
-      page: query.page ? Number(query.page) : undefined,
-      pageSize: query.pageSize ? Number(query.pageSize) : undefined,
-    })
+    const result = await listPosts(
+      {
+        category: query.category,
+        tag: query.tag,
+        authorId: query.authorId ? Number(query.authorId) : undefined,
+        sort: query.sort,
+        page: query.page ? Number(query.page) : undefined,
+        pageSize: query.pageSize ? Number(query.pageSize) : undefined,
+      },
+      request.user?.id,
+    )
 
     sendSuccess(reply, result)
   })

@@ -23,6 +23,9 @@ import { userRoutes } from './routes/user.routes.js'
 import { adminRoutes } from './routes/admin.routes.js'
 import { searchRoutes } from './routes/search.routes.js'
 import { configRoutes } from './routes/config.routes.js'
+import { notificationRoutes } from './routes/notification.routes.js'
+import { bookmarkRoutes } from './routes/bookmark.routes.js'
+import { followRoutes } from './routes/follow.routes.js'
 import { sendSuccess } from './utils/response.js'
 
 export const fastify = Fastify({ logger: true })
@@ -136,6 +139,9 @@ await fastify.register(userRoutes)
 await fastify.register(adminRoutes)
 await fastify.register(searchRoutes)
 await fastify.register(configRoutes)
+await fastify.register(notificationRoutes)
+await fastify.register(bookmarkRoutes)
+await fastify.register(followRoutes)
 
 // [规范例外] health check 和 /test-tg 的查询/读文件逻辑直接写在这里，
 // 因为没有对应的 service，为 3 行逻辑新建 service 文件反而过度

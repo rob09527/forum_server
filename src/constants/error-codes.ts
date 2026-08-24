@@ -69,6 +69,24 @@ export const ErrorCode = {
   /** 还没有点赞，无法取消 */
   NOT_LIKED: 'NOT_LIKED',
 
+  // ── 收藏 ──
+  /** 已经收藏过了 */
+  ALREADY_BOOKMARKED: 'ALREADY_BOOKMARKED',
+  /** 还没收藏，无法取消 */
+  NOT_BOOKMARKED: 'NOT_BOOKMARKED',
+
+  // ── 关注 ──
+  /** 不能关注自己 */
+  CANNOT_FOLLOW_SELF: 'CANNOT_FOLLOW_SELF',
+  /** 已经关注过了 */
+  ALREADY_FOLLOWING: 'ALREADY_FOLLOWING',
+  /** 还没关注，无法取关 */
+  NOT_FOLLOWING: 'NOT_FOLLOWING',
+
+  // ── 通知 ──
+  /** 通知不存在 */
+  NOTIFICATION_NOT_FOUND: 'NOTIFICATION_NOT_FOUND',
+
   // ── 上传 ──
   /** 没有收到文件 */
   UPLOAD_NO_FILE: 'UPLOAD_NO_FILE',

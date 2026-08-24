@@ -27,6 +27,8 @@ export interface PostListItem {
   commentCount: number
   /** 是否置顶 */
   isPinned: boolean
+  /** 当前登录用户是否已收藏（未登录或未注入时为 false；收藏为私密仅本人可见） */
+  isBookmarked: boolean
   /** 最后回复用户，MVP 无评论系统前为 null */
   lastReplyUser: string | null
   /** 最后回复时间，MVP 无评论系统前为 null */
@@ -38,20 +40,24 @@ export interface PostListItem {
 /**
  * 将 Prisma Post（含 author）转为列表项。
  * post.service 与 search.service 共用，保证列表/搜索返回同一结构。
+ * isBookmarked 为当前登录用户的收藏态，由调用方批量注入（默认 false）。
  */
-export function toListItem(post: {
-  id: number
-  title: string
-  category: string
-  tags: string[]
-  author: { id: number; username: string; avatar: string | null; level: string }
-  viewCount: number
-  likeCount: number
-  commentCount: number
-  isPinned: boolean
-  createdAt: Date
-  updatedAt: Date
-}): PostListItem {
+export function toListItem(
+  post: {
+    id: number
+    title: string
+    category: string
+    tags: string[]
+    author: { id: number; username: string; avatar: string | null; level: string }
+    viewCount: number
+    likeCount: number
+    commentCount: number
+    isPinned: boolean
+    createdAt: Date
+    updatedAt: Date
+  },
+  isBookmarked = false,
+): PostListItem {
   return {
     id: post.id,
     title: post.title,
@@ -67,6 +73,7 @@ export function toListItem(post: {
     likeCount: post.likeCount,
     commentCount: post.commentCount,
     isPinned: post.isPinned,
+    isBookmarked,
     lastReplyUser: null,
     lastReplyTime: null,
     createdAt: post.createdAt.toISOString(),

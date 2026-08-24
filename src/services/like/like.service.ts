@@ -1,8 +1,9 @@
 import { prisma } from '../../lib/prisma.js'
 import { ErrorCode } from '../../constants/error-codes.js'
 import { ConflictError, NotFoundError } from '../../utils/errors.js'
-import { PointType } from '../../constants/business.js'
+import { PointType, NotificationType } from '../../constants/business.js'
 import { earnPoints } from '../points/points.service.js'
+import { createAndPush } from '../notification/notification.service.js'
 
 /**
  * 点赞服务。
@@ -18,13 +19,18 @@ import { earnPoints } from '../points/points.service.js'
 
 /** 点赞帖子，返回更新后的 likeCount */
 export async function likePost(postId: number, userId: number): Promise<number> {
-  try {
-    return await prisma.$transaction(async (tx) => {
-      const post = await tx.post.findUnique({ where: { id: postId }, select: { id: true, authorId: true } })
-      if (!post) {
-        throw new NotFoundError('帖子', ErrorCode.POST_NOT_FOUND)
-      }
+  // 事务前取作者（供事务提交后发「被点赞」通知），post 存在性由事务内唯一约束/更新兜底，但仍先查一次避免无谓写入
+  const post = await prisma.post.findUnique({
+    where: { id: postId },
+    select: { id: true, authorId: true },
+  })
+  if (!post) {
+    throw new NotFoundError('帖子', ErrorCode.POST_NOT_FOUND)
+  }
 
+  let likeCount: number
+  try {
+    likeCount = await prisma.$transaction(async (tx) => {
       // 先查已有记录，决定「首赞」还是「取消后重赞」；并发竞态由唯一约束 P2002 兜底（外层 catch）
       const existing = await tx.postLike.findUnique({
         where: { postId_userId: { postId, userId } },
@@ -49,7 +55,7 @@ export async function likePost(postId: number, userId: number): Promise<number> 
 
       const updated = await tx.post.update({
         where: { id: postId },
-        data: { likeCount: { increment: 1 } },
+        data: { likeCount: { increment: 1 }, heatScore: { increment: 300 } },
         select: { likeCount: true },
       })
 
@@ -67,6 +73,18 @@ export async function likePost(postId: number, userId: number): Promise<number> 
     }
     throw err
   }
+
+  // 通知帖子作者（fire-and-forget；排除自赞）
+  if (post.authorId !== userId) {
+    createAndPush({
+      userId: post.authorId,
+      type: NotificationType.LIKE,
+      actorId: userId,
+      postId,
+    })
+  }
+
+  return likeCount
 }
 
 /** 取消点赞帖子，返回更新后的 likeCount */
@@ -88,7 +106,7 @@ export async function unlikePost(postId: number, userId: number): Promise<number
 
     const updated = await tx.post.update({
       where: { id: postId },
-      data: { likeCount: { decrement: 1 } },
+      data: { likeCount: { decrement: 1 }, heatScore: { decrement: 300 } },
       select: { likeCount: true },
     })
     return updated.likeCount
@@ -97,13 +115,18 @@ export async function unlikePost(postId: number, userId: number): Promise<number
 
 /** 点赞评论，返回更新后的 likeCount */
 export async function likeComment(commentId: number, userId: number): Promise<number> {
-  try {
-    return await prisma.$transaction(async (tx) => {
-      const comment = await tx.comment.findUnique({ where: { id: commentId }, select: { id: true, authorId: true } })
-      if (!comment) {
-        throw new NotFoundError('评论', ErrorCode.COMMENT_NOT_FOUND)
-      }
+  // 事务前取作者（供事务提交后发「被点赞」通知）
+  const comment = await prisma.comment.findUnique({
+    where: { id: commentId },
+    select: { id: true, authorId: true },
+  })
+  if (!comment) {
+    throw new NotFoundError('评论', ErrorCode.COMMENT_NOT_FOUND)
+  }
 
+  let likeCount: number
+  try {
+    likeCount = await prisma.$transaction(async (tx) => {
       const existing = await tx.commentLike.findUnique({
         where: { commentId_userId: { commentId, userId } },
       })
@@ -142,6 +165,18 @@ export async function likeComment(commentId: number, userId: number): Promise<nu
     }
     throw err
   }
+
+  // 通知评论作者（fire-and-forget；排除自赞）
+  if (comment.authorId !== userId) {
+    createAndPush({
+      userId: comment.authorId,
+      type: NotificationType.LIKE,
+      actorId: userId,
+      commentId,
+    })
+  }
+
+  return likeCount
 }
 
 /** 取消点赞评论，返回更新后的 likeCount */
