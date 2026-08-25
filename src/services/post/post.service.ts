@@ -1,21 +1,25 @@
 import { prisma } from '../../lib/prisma.js'
 import { config } from '../../config.js'
-import { PointType, UserRole } from '../../constants/business.js'
+import { PointType, UserRole, BountyStatus } from '../../constants/business.js'
 import {
   NotFoundError,
   ForbiddenError,
   ValidationError,
+  ConflictError,
 } from '../../utils/errors.js'
 import { ErrorCode } from '../../constants/error-codes.js'
 import { redis, RedisKey } from '../../lib/redis.js'
 import { cleanPostImages, extractImagePaths } from '../upload/upload.service.js'
-import { earnPoints } from '../points/points.service.js'
+import { earnPoints, spendPoints } from '../points/points.service.js'
+import { getBountyConfig } from '../config/config.service.js'
 import { getBookmarkedIds } from '../bookmark/bookmark.service.js'
 import type { UserPublic } from '../auth/auth.service.js'
 import { toListItem } from './post-formatter.js'
 import type { PostListItem } from './post-formatter.js'
 import { indexPost, removePost } from '../search/search.service.js'
 import { notifyMentions } from '../notification/notification.service.js'
+import { AUTHOR_SELECT } from '../user/user-decorator.js'
+import type { AuthorRow } from '../user/user-decorator.js'
 
 // 对外保持 post.service 仍是 PostListItem 的出口（引用处无需改动）
 export type { PostListItem } from './post-formatter.js'
@@ -30,6 +34,8 @@ export interface CreatePostInput {
   category: string
   /** 标签列表，最多 5 个，每个最长 20 字符 */
   tags?: string[]
+  /** 悬赏金额（鸡腿）；传值时本帖为悬赏帖，发起即扣款（事务内托管）[1.6.4] */
+  bountyAmount?: number
 }
 
 /** 帖子编辑请求，category 不可修改 */
@@ -52,6 +58,8 @@ export interface PostListQuery {
   authorId?: number
   /** 排序：latest(最新) | hot(最热)，默认 latest */
   sort?: 'latest' | 'hot'
+  /** 悬赏筛选：只列出指定状态的悬赏帖（悬赏 tab 用，不传不过滤）[1.6.6] */
+  bountyStatus?: 'escrow' | 'settled' | 'refunded'
   /** 页码，从 1 开始 */
   page?: number
   /** 每页条数，最大 50，默认 20 */
@@ -64,6 +72,23 @@ export interface PostDetail extends PostListItem {
   content: string
   /** 最后更新时间，ISO 8601（编辑后可展示"最后编辑于"） */
   updatedAt: string
+  /**
+   * 已采纳的回答评论 ID（悬赏帖，读 Bounty.acceptedCommentId 权威源）。
+   * 非悬赏帖 / 未结算 / 零有效回答退款为 null；供详情页「采纳置顶」标记 [3.5]。
+   * 仅 GET /api/posts/:id 填充（列表/建帖/编辑响应不填，前端按需 refetch）。
+   */
+  bountyAcceptedCommentId?: number | null
+  /**
+   * 悬赏到期时间，ISO 8601（托管中，读 Bounty.expireAt 权威源）。
+   * 供详情横幅倒计时 [3.5]；仅 GET /api/posts/:id 填充，其余响应为 undefined。
+   */
+  bountyExpireAt?: string | null
+  /**
+   * Bounty 账本记录 ID（悬赏帖，读 Bounty.id 权威源）。
+   * 采纳/取消端点 `POST /api/bounties/:id/accept|cancel` 的 :id 用的是 Bounty.id 而非 post id；
+   * 前端详情页据此调用。仅 GET /api/posts/:id 填充。
+   */
+  bountyId?: number | null
 }
 
 /** 分页结果 */
@@ -97,7 +122,7 @@ export interface HotPost {
  * 校验通过后写入 DB，作者 postCount +1。
  */
 export async function createPost(input: CreatePostInput, authorId: number): Promise<PostDetail> {
-  const { title, content, category, tags = [] } = input
+  const { title, content, category, tags = [], bountyAmount } = input
 
   // 标题校验
   const trimmedTitle = title?.trim() ?? ''
@@ -142,7 +167,7 @@ export async function createPost(input: CreatePostInput, authorId: number): Prom
       },
       include: {
         author: {
-          select: { id: true, username: true, avatar: true, level: true },
+          select: AUTHOR_SELECT,
         },
       },
     })
@@ -155,6 +180,55 @@ export async function createPost(input: CreatePostInput, authorId: number): Prom
 
     // [R1] 发帖 +10 鸡腿，当日最多 3 帖有分，超限静默跳过
     const result = await earnPoints(authorId, PointType.POST, { refId: post.id }, tx)
+
+    // [1.6.4] 悬赏发起：建帖事务内追加（发起即扣款，失败整个事务回滚、帖子不建）
+    if (bountyAmount !== undefined) {
+      const cfg = await getBountyConfig()
+      if (bountyAmount < cfg.amountMin || bountyAmount > cfg.amountMax) {
+        throw new ValidationError(
+          `悬赏金额需在 ${cfg.amountMin}-${cfg.amountMax} 之间`,
+          ErrorCode.BOUNTY_AMOUNT_INVALID,
+        )
+      }
+      const activeCount = await tx.bounty.count({ where: { userId: authorId, status: BountyStatus.ESCROW } })
+      if (activeCount >= cfg.maxActivePerUser) {
+        throw new ConflictError(`同时进行的悬赏不能超过 ${cfg.maxActivePerUser} 个`, ErrorCode.BOUNTY_LIMIT_EXCEEDED)
+      }
+      // 发起门槛（2.6 配置）：累计鸡腿 + 注册天数，二选一或并用 [1.8]
+      const author = await tx.user.findUnique({
+        where: { id: authorId },
+        select: { totalPointsEarned: true, createdAt: true },
+      })
+      if (author) {
+        if (author.totalPointsEarned < cfg.minTotalEarned) {
+          throw new ForbiddenError(`累计鸡腿达到 ${cfg.minTotalEarned} 才能发起悬赏`)
+        }
+        const regDays = Math.floor((Date.now() - author.createdAt.getTime()) / 86400_000)
+        if (regDays < cfg.minRegisterDays) {
+          throw new ForbiddenError(`注册满 ${cfg.minRegisterDays} 天才能发起悬赏`)
+        }
+      }
+      const now = new Date()
+      // 托管扣款 [R44]；refId 指向帖子
+      await spendPoints(authorId, PointType.BOUNTY_OUT, bountyAmount, { refId: post.id }, tx)
+      await tx.bounty.create({
+        data: {
+          postId: post.id,
+          userId: authorId,
+          amount: bountyAmount,
+          status: BountyStatus.ESCROW,
+          expireAt: new Date(now.getTime() + cfg.timeoutDays * 86400_000),
+        },
+      })
+      // 冗余列同事务：列表徽章 + 悬赏筛选 tab 都靠 posts.bountyStatus 渲染 [1.6.6]
+      await tx.post.update({
+        where: { id: post.id },
+        data: { bountyAmount, bountyStatus: BountyStatus.ESCROW },
+      })
+      // 内存对象同步补上冗余列：create 响应（toDetail）直接体现「待解决」徽章，避免前端看到无悬赏状态
+      post.bountyAmount = bountyAmount
+      post.bountyStatus = BountyStatus.ESCROW
+    }
 
     return { post, result }
   })
@@ -190,7 +264,7 @@ export async function getPostById(id: number, viewerId?: number): Promise<PostDe
     where: { id },
     include: {
       author: {
-        select: { id: true, username: true, avatar: true, level: true },
+        select: AUTHOR_SELECT,
       },
     },
   })
@@ -219,6 +293,20 @@ export async function getPostById(id: number, viewerId?: number): Promise<PostDe
 
   const detail = toDetail(post)
   detail.isBookmarked = isBookmarked
+
+  // 悬赏帖补充权威源信息 [3.5]：托管中 → 到期时间（横幅倒计时）；已结算 → 被采纳回答（置顶）
+  if (post.bountyStatus === BountyStatus.ESCROW || post.bountyStatus === BountyStatus.SETTLED) {
+    const bounty = await prisma.bounty.findFirst({
+      where: { postId: post.id, status: post.bountyStatus },
+      select: { id: true, expireAt: true, acceptedCommentId: true },
+    })
+    if (bounty) {
+      detail.bountyId = bounty.id
+      detail.bountyExpireAt = bounty.expireAt.toISOString()
+      detail.bountyAcceptedCommentId = bounty?.acceptedCommentId ?? null
+    }
+  }
+
   return detail
 }
 
@@ -276,6 +364,8 @@ export async function listPosts(
     ...(tag ? { tags: { has: tag } } : {}),
     // 作者筛选：只查某位用户发布的帖子
     ...(authorId ? { authorId } : {}),
+    // 悬赏筛选：悬赏 tab 默认只展示托管中（escrow）待解决 [1.6.6]
+    ...(query.bountyStatus ? { bountyStatus: query.bountyStatus } : {}),
   }
 
   // hot：最近 7 天 + 按物化 heatScore 降序（写路径增量维护，公式 = likeCount*300 + commentCount*200 + viewCount）。
@@ -290,7 +380,7 @@ export async function listPosts(
         where: hotWhere,
         include: {
           author: {
-            select: { id: true, username: true, avatar: true, level: true },
+            select: AUTHOR_SELECT,
           },
         },
         orderBy: [{ isPinned: 'desc' }, { heatScore: 'desc' }],
@@ -317,7 +407,7 @@ export async function listPosts(
       where,
       include: {
         author: {
-          select: { id: true, username: true, avatar: true, level: true },
+          select: AUTHOR_SELECT,
         },
       },
       orderBy: [{ isPinned: 'desc' }, { createdAt: 'desc' }],
@@ -387,7 +477,7 @@ export async function updatePost(id: number, input: UpdatePostInput, userId: num
     data,
     include: {
       author: {
-        select: { id: true, username: true, avatar: true, level: true },
+        select: AUTHOR_SELECT,
       },
     },
   })
@@ -408,6 +498,12 @@ async function performDelete(id: number): Promise<void> {
   const existing = await prisma.post.findUnique({ where: { id } })
   if (!existing) {
     throw new NotFoundError('帖子', ErrorCode.POST_NOT_FOUND)
+  }
+
+  // [1.6.6] 托管中的悬赏帖不可删除（避免托管金随帖子级联消失）；
+  // 可等超时自动结算后再删，异常走后台人工退款（adminRefundBounty）
+  if (existing.bountyStatus === BountyStatus.ESCROW) {
+    throw new ConflictError('托管中的悬赏帖不可删除，请等待超时结算或联系管理员')
   }
 
   // 提取正文中引用的本地图片路径（相对路径 /uploads/...）
@@ -472,8 +568,8 @@ export async function getHotPosts(limit = 10): Promise<HotPost[]> {
     id: p.id,
     title: p.title,
     category: p.category,
-    // 物化列存 ×100 整数，对外展示还原为与旧 heatScore() 一致的浮点值
-    heatScore: p.heatScore / 100,
+    // heatScore 列即为裸整数热度（view+1 / comment+200 / like+300），直接下发
+    heatScore: p.heatScore,
   }))
 }
 
@@ -484,10 +580,14 @@ function toDetail(post: {
   content: string
   category: string
   tags: string[]
-  author: { id: number; username: string; avatar: string | null; level: string }
+  author: AuthorRow
   viewCount: number
   likeCount: number
   commentCount: number
+  tipCount: number
+  tipAmount: number
+  bountyAmount: number | null
+  bountyStatus: string | null
   isPinned: boolean
   createdAt: Date
   updatedAt: Date

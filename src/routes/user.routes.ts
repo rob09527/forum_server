@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify'
-import { getUserProfile, getUserPointsLog, getLatestUsers, searchUsers, updateAvatar } from '../services/user/user.service.js'
+import { getUserProfile, getUserPointsLog, getLatestUsers, searchUsers, updateAvatar, checkUsernameAvailable } from '../services/user/user.service.js'
 import { authenticate } from '../middleware/auth.middleware.js'
 import { parseId } from '../utils/parse.js'
 import { sendSuccess } from '../utils/response.js'
@@ -75,6 +75,28 @@ export async function userRoutes(fastify: FastifyInstance): Promise<void> {
     const query = request.query as { q?: string }
     const users = await searchUsers(query.q ?? '')
     sendSuccess(reply, users)
+  })
+
+  /**
+   * GET /api/users/username-available?username=xxx
+   * 改名用户名可用性（需登录，排除当前用户自己）。返回 { available: boolean }。
+   * 与 POST /api/me/rename 查重同口径，改名弹窗「实时唯一性提示」用 [3.6]。
+   */
+  fastify.get('/api/users/username-available', {
+    preHandler: [authenticate],
+    schema: {
+      querystring: {
+        type: 'object',
+        required: ['username'],
+        properties: {
+          username: { type: 'string', minLength: 1, maxLength: 20 },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const { username } = request.query as { username: string }
+    const available = await checkUsernameAvailable(username, request.user!.id)
+    sendSuccess(reply, { available })
   })
 
   /**

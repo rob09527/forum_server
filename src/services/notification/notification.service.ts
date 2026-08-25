@@ -9,6 +9,7 @@ import {
 } from '../../constants/business.js'
 import type { SystemNotifyTargetType, NotificationTypeType } from '../../constants/business.js'
 import { redis, RedisKey } from '../../lib/redis.js'
+import { effectiveAvatar } from '../../utils/avatar.js'
 import { pushToUser, pushToAllOnline } from './sse.js'
 import { extractMentionedUserIds } from '../../utils/mention.js'
 
@@ -108,12 +109,18 @@ export async function createNotification(
   const aggregateKey: Record<string, unknown> | null = (() => {
     switch (type) {
       case NotificationType.LIKE:
+      // [2.3] TIP 与 LIKE 同款聚合：同一帖子/评论的未读打赏合并一条、actor 累加 →「张三等 3 人打赏了你的帖子」
+      case NotificationType.TIP:
         return commentId !== undefined && commentId !== null
           ? { commentId }
           : { postId: postId ?? null }
       case NotificationType.FOLLOW:
         return {}
       case NotificationType.COMMENT:
+      // [2.3] 悬赏三态通知同帖合并：同帖多次新回答/结算/退款提醒聚合为一条、actor 累加
+      case NotificationType.BOUNTY_REPLY:
+      case NotificationType.BOUNTY_SETTLED:
+      case NotificationType.BOUNTY_REFUNDED:
         return { postId: postId ?? null }
       default:
         // reply / system 不聚合：reply 每条独立线程，system 由广播批量落库不走此路径
@@ -290,9 +297,11 @@ export async function listNotifications(
     actorIds.length
       ? prisma.user.findMany({
           where: { id: { in: actorIds } },
-          select: { id: true, username: true, avatar: true },
+          select: { id: true, username: true, avatar: true, decorAvatarValue: true, decorAvatarExpireAt: true },
         })
-      : Promise.resolve([] as { id: number; username: string; avatar: string | null }[]),
+      : Promise.resolve(
+          [] as { id: number; username: string; avatar: string | null; decorAvatarValue: string | null; decorAvatarExpireAt: Date | null }[],
+        ),
     postIds.length
       ? prisma.post.findMany({
           where: { id: { in: postIds } },
@@ -313,7 +322,9 @@ export async function listNotifications(
       : Promise.resolve([] as { id: number; content: string }[]),
   ])
 
-  const actorMap = new Map(actors.map((a) => [a.id, a]))
+  const actorMap = new Map(
+    actors.map((a) => [a.id, { id: a.id, username: a.username, avatar: effectiveAvatar(a.avatar, a.decorAvatarValue, a.decorAvatarExpireAt) }]),
+  )
   const postMap = new Map(posts.map((p) => [p.id, p]))
   const commentMap = new Map(comments.map((c) => [c.id, c]))
   const messageMap = new Map(messages.map((m) => [m.id, m.content]))

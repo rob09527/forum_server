@@ -6,7 +6,8 @@ import { OAuthProvider, UserStatus } from '../../constants/business.js'
 import type { UserStatusType } from '../../constants/business.js'
 import { ConflictError, ForbiddenError, InvalidCredentialsError, UnauthorizedError } from '../../utils/errors.js'
 import { hashPassword, verifyPassword } from '../../utils/password.js'
-import { deterministicLocalAvatar } from '../../utils/avatar.js'
+import { deterministicLocalAvatar, effectiveAvatar } from '../../utils/avatar.js'
+import { pickRandomFreeAvatar } from '../shop/shop.service.js'
 import { generateToken } from './auth-token.service.js'
 import { prisma } from '../../lib/prisma.js'
 
@@ -36,7 +37,43 @@ export interface UserPublic {
   oauthProvider: string | null
   /** 注册时间，ISO 8601 格式 */
   createdAt: Date
+  /** 生效中的用户名颜色渲染值；null 或已过期则不上色 [1.3.7] */
+  decorColorValue: string | null
+  /** 用户名颜色到期时间 */
+  decorColorExpireAt: Date | null
+  /** 生效中的称号文本；null 或已过期则无称号 */
+  decorTitleValue: string | null
+  /** 称号徽章配色 key，与 decorTitleValue 成对存储 */
+  decorTitleStyle: string | null
+  /** 称号到期时间 */
+  decorTitleExpireAt: Date | null
 }
+
+/**
+ * UserPublic 的统一 select（auth 各入口 / updateAvatar / 中间件注入复用）。
+ * 含装饰生效槽 5 列：右栏「我的装饰」与全站用户名渲染需要，见 user-decorator.ts [1.3.7][2.2]。
+ */
+export const USER_PUBLIC_SELECT = {
+  id: true,
+  username: true,
+  email: true,
+  avatar: true,
+  bio: true,
+  level: true,
+  points: true,
+  stars: true,
+  role: true,
+  status: true,
+  oauthProvider: true,
+  createdAt: true,
+  decorAvatarValue: true,
+  decorAvatarExpireAt: true,
+  decorColorValue: true,
+  decorColorExpireAt: true,
+  decorTitleValue: true,
+  decorTitleStyle: true,
+  decorTitleExpireAt: true,
+} as const
 
 /** 将 Prisma User 转为前端安全的 UserPublic */
 function toPublic(user: {
@@ -52,12 +89,20 @@ function toPublic(user: {
   status: string
   oauthProvider: string | null
   createdAt: Date
+  decorAvatarValue: string | null
+  decorAvatarExpireAt: Date | null
+  decorColorValue: string | null
+  decorColorExpireAt: Date | null
+  decorTitleValue: string | null
+  decorTitleStyle: string | null
+  decorTitleExpireAt: Date | null
 }): UserPublic {
   return {
     id: user.id,
     username: user.username,
     email: user.email,
-    avatar: user.avatar,
+    // 头像折叠：租用头像未过期优先，否则基础头像（双槽对前端透明）
+    avatar: effectiveAvatar(user.avatar, user.decorAvatarValue, user.decorAvatarExpireAt),
     bio: user.bio,
     level: user.level,
     points: user.points,
@@ -66,6 +111,11 @@ function toPublic(user: {
     status: user.status as UserStatusType,
     oauthProvider: user.oauthProvider,
     createdAt: user.createdAt,
+    decorColorValue: user.decorColorValue,
+    decorColorExpireAt: user.decorColorExpireAt,
+    decorTitleValue: user.decorTitleValue,
+    decorTitleStyle: user.decorTitleStyle,
+    decorTitleExpireAt: user.decorTitleExpireAt,
   }
 }
 
@@ -99,24 +149,11 @@ export async function register(input: {
       username,
       email,
       passwordHash,
-      // 邮箱注册按用户名确定性映射一个本地预置头像（与前端展示兜底同一算法，无外网依赖）
-      avatar: deterministicLocalAvatar(username),
+      // 注册从免费头像池随机分配一个（头像商品化）；池为空（未播种/全付费）兜底回确定性映射
+      avatar: (await pickRandomFreeAvatar()) ?? deterministicLocalAvatar(username),
       // oauthProvider 和 oauthId 留 null，表示本站邮箱注册
     },
-    select: {
-      id: true,
-      username: true,
-      email: true,
-      avatar: true,
-      bio: true,
-      level: true,
-      points: true,
-      stars: true,
-      role: true,
-      status: true,
-      oauthProvider: true,
-      createdAt: true,
-    },
+    select: USER_PUBLIC_SELECT,
   })
 
   const token = await generateToken(user.id)
@@ -134,21 +171,7 @@ export async function login(input: {
   // 不区分"用户不存在"和"密码错误"——防邮箱枚举
   const user = await prisma.user.findUnique({
     where: { email },
-    select: {
-      id: true,
-      username: true,
-      email: true,
-      avatar: true,
-      bio: true,
-      level: true,
-      points: true,
-      stars: true,
-      role: true,
-      status: true,
-      oauthProvider: true,
-      createdAt: true,
-      passwordHash: true,
-    },
+    select: { ...USER_PUBLIC_SELECT, passwordHash: true },
   })
 
   if (!user || !user.passwordHash) {
@@ -228,20 +251,7 @@ export async function telegramAuth(
   // 2. 查找已有用户
   const existing = await prisma.user.findUnique({
     where: { oauthId: tgId },
-    select: {
-      id: true,
-      username: true,
-      email: true,
-      avatar: true,
-      bio: true,
-      level: true,
-      points: true,
-      stars: true,
-      role: true,
-      status: true,
-      oauthProvider: true,
-      createdAt: true,
-    },
+    select: USER_PUBLIC_SELECT,
   })
 
   if (existing) {
@@ -264,24 +274,12 @@ export async function telegramAuth(
       username,
       email: null,
       passwordHash: null,
-      avatar: data.photo_url ?? null,
+      // 有 TG 照片用照片，无照片从免费池随机分配；池为空兜底 null（前端确定性渲染）
+      avatar: data.photo_url ?? (await pickRandomFreeAvatar()) ?? null,
       oauthProvider: OAuthProvider.TELEGRAM,
       oauthId: tgId,
     },
-    select: {
-      id: true,
-      username: true,
-      email: true,
-      avatar: true,
-      bio: true,
-      level: true,
-      points: true,
-      stars: true,
-      role: true,
-      status: true,
-      oauthProvider: true,
-      createdAt: true,
-    },
+    select: USER_PUBLIC_SELECT,
   })
 
   const token = await generateToken(user.id)
@@ -312,20 +310,7 @@ async function generateUsername(tgUsername: string): Promise<string> {
 export async function getUserById(userId: number): Promise<UserPublic | null> {
   const user = await prisma.user.findUnique({
     where: { id: userId },
-    select: {
-      id: true,
-      username: true,
-      email: true,
-      avatar: true,
-      bio: true,
-      level: true,
-      points: true,
-      stars: true,
-      role: true,
-      status: true,
-      oauthProvider: true,
-      createdAt: true,
-    },
+    select: USER_PUBLIC_SELECT,
   })
   return user ? toPublic(user) : null
 }

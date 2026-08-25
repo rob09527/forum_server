@@ -37,6 +37,7 @@ export async function postRoutes(fastify: FastifyInstance): Promise<void> {
         type: 'object',
         properties: {
           sort: { type: 'string', enum: ['latest', 'hot'] },
+          bountyStatus: { type: 'string', enum: ['escrow', 'settled', 'refunded'] },
         },
       },
     },
@@ -48,6 +49,7 @@ export async function postRoutes(fastify: FastifyInstance): Promise<void> {
       /** 按作者 ID 过滤（「我的帖子」用） */
       authorId?: number
       sort?: 'latest' | 'hot'
+      bountyStatus?: 'escrow' | 'settled' | 'refunded'
       page?: number
       pageSize?: number
     }
@@ -58,6 +60,7 @@ export async function postRoutes(fastify: FastifyInstance): Promise<void> {
         tag: query.tag,
         authorId: query.authorId ? Number(query.authorId) : undefined,
         sort: query.sort,
+        bountyStatus: query.bountyStatus,
         page: query.page ? Number(query.page) : undefined,
         pageSize: query.pageSize ? Number(query.pageSize) : undefined,
       },
@@ -92,6 +95,8 @@ export async function postRoutes(fastify: FastifyInstance): Promise<void> {
           content: { type: 'string', minLength: 1 },
           category: { type: 'string' },
           tags: { type: 'array', maxItems: 5, items: { type: 'string', maxLength: 20 } },
+          // 悬赏问答（2.4）：可选，传了即为悬赏帖。金额合法区间在 service 内按 config:bounty 校验
+          bountyAmount: { type: 'integer', minimum: 1 },
         },
       },
     },
@@ -106,6 +111,7 @@ export async function postRoutes(fastify: FastifyInstance): Promise<void> {
       content: string
       category: string
       tags?: string[]
+      bountyAmount?: number
     }
 
     const post = await createPost(
@@ -114,6 +120,7 @@ export async function postRoutes(fastify: FastifyInstance): Promise<void> {
         content: body.content,
         category: body.category,
         tags: body.tags,
+        bountyAmount: body.bountyAmount,
       },
       user.id,
     )

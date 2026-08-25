@@ -5,6 +5,7 @@ import { ErrorCode } from '../../constants/error-codes.js'
 import { toListItem } from '../post/post-formatter.js'
 import type { PostListItem } from '../post/post-formatter.js'
 import type { Paginated } from '../post/post.service.js'
+import { AUTHOR_SELECT } from '../user/user-decorator.js'
 
 /** 搜索查询参数 */
 export interface SearchQuery {
@@ -118,7 +119,7 @@ export async function searchPosts(
         where: { id: { in: ids } },
         include: {
           author: {
-            select: { id: true, username: true, avatar: true, level: true },
+            select: AUTHOR_SELECT,
           },
         },
       })

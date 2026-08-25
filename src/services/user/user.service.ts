@@ -4,9 +4,12 @@ import { NotFoundError, ValidationError, ForbiddenError } from '../../utils/erro
 import { levelProgress } from '../points/points.service.js'
 import type { LevelProgress } from '../points/points.service.js'
 import { getLevels } from '../config/config.service.js'
+import { isAvatarFree } from '../shop/shop.service.js'
 import { ALLOWED_AVATAR_STYLES, AVATARS_PER_STYLE, UserStatus } from '../../constants/business.js'
+import { effectiveAvatar } from '../../utils/avatar.js'
 import type { UserStatusType } from '../../constants/business.js'
 import type { UserPublic } from '../auth/auth.service.js'
+import { USER_PUBLIC_SELECT } from '../auth/auth.service.js'
 
 /**
  * 用户公开资料 + 积分流水服务。
@@ -45,6 +48,16 @@ export interface UserProfile {
   createdAt: string
   /** 等级进度：下一等级门槛 + 还差多少 [R21] */
   levelProgress: LevelProgress
+  /** 生效中的用户名颜色渲染值；null 或已过期则不上色 [1.3.7] */
+  decorColorValue: string | null
+  /** 用户名颜色到期时间 */
+  decorColorExpireAt: Date | null
+  /** 生效中的称号文本；null 或已过期则无称号 */
+  decorTitleValue: string | null
+  /** 称号徽章配色 key，与 decorTitleValue 成对存储 */
+  decorTitleStyle: string | null
+  /** 称号到期时间 */
+  decorTitleExpireAt: Date | null
 }
 
 /** 积分流水项 */
@@ -93,13 +106,13 @@ export async function getLatestUsers(limit = 8): Promise<NewUserItem[]> {
   const users = await prisma.user.findMany({
     orderBy: { createdAt: 'desc' },
     take,
-    select: { id: true, username: true, avatar: true, createdAt: true },
+    select: { id: true, username: true, avatar: true, decorAvatarValue: true, decorAvatarExpireAt: true, createdAt: true },
   })
 
   return users.map((u) => ({
     id: u.id,
     username: u.username,
-    avatar: u.avatar,
+    avatar: effectiveAvatar(u.avatar, u.decorAvatarValue, u.decorAvatarExpireAt),
     createdAt: u.createdAt.toISOString(),
   }))
 }
@@ -141,10 +154,43 @@ export async function searchUsers(
     },
     orderBy: { username: 'asc' },
     take,
-    select: { id: true, username: true, avatar: true, level: true },
+    select: {
+      id: true,
+      username: true,
+      avatar: true,
+      decorAvatarValue: true,
+      decorAvatarExpireAt: true,
+      level: true,
+    },
   })
 
-  return users
+  return users.map((u) => ({
+    id: u.id,
+    username: u.username,
+    avatar: effectiveAvatar(u.avatar, u.decorAvatarValue, u.decorAvatarExpireAt),
+    level: u.level,
+  }))
+}
+
+/**
+ * 改名用户名可用性检查（与 props.service.rename 的查重同口径：精确匹配）。
+ * excludeUserId 为当前用户 ID：改名时排除自己，避免把自己的现名判为占用。
+ * 返回 true 表示可用。供前端改名弹窗「实时唯一性提示」[3.6]。
+ */
+export async function checkUsernameAvailable(
+  username: string,
+  excludeUserId?: number,
+): Promise<boolean> {
+  const name = username?.trim() ?? ''
+  if (!name) return false
+  const existing = await prisma.user.findFirst({
+    where: {
+      username: name,
+      ...(excludeUserId ? { NOT: { id: excludeUserId } } : {}),
+    },
+    select: { id: true },
+  })
+  return existing === null
 }
 
 /** 查询用户公开资料。viewerId 为当前登录用户，鸡腿余额仅本人可见（陌生人返回 null）。 */
@@ -165,6 +211,13 @@ export async function getUserProfile(userId: number, viewerId?: number): Promise
       followerCount: true,
       followingCount: true,
       createdAt: true,
+      decorAvatarValue: true,
+      decorAvatarExpireAt: true,
+      decorColorValue: true,
+      decorColorExpireAt: true,
+      decorTitleValue: true,
+      decorTitleStyle: true,
+      decorTitleExpireAt: true,
     },
   })
   if (!user) {
@@ -188,7 +241,8 @@ export async function getUserProfile(userId: number, viewerId?: number): Promise
   return {
     id: user.id,
     username: user.username,
-    avatar: user.avatar,
+    // 头像折叠：租用头像未过期优先，否则基础头像
+    avatar: effectiveAvatar(user.avatar, user.decorAvatarValue, user.decorAvatarExpireAt),
     bio: user.bio,
     level: progress.level,
     points: viewerId === userId ? user.points : null,
@@ -201,6 +255,11 @@ export async function getUserProfile(userId: number, viewerId?: number): Promise
     isFollowing,
     createdAt: user.createdAt.toISOString(),
     levelProgress: progress,
+    decorColorValue: user.decorColorValue,
+    decorColorExpireAt: user.decorColorExpireAt,
+    decorTitleValue: user.decorTitleValue,
+    decorTitleStyle: user.decorTitleStyle,
+    decorTitleExpireAt: user.decorTitleExpireAt,
   }
 }
 
@@ -279,23 +338,17 @@ export async function updateAvatar(userId: number, avatar: string): Promise<User
     throw new NotFoundError('用户', ErrorCode.NOT_FOUND)
   }
 
+  // 头像商品化：仅免费头像可自选；付费头像需在商城购买解锁（buyDecoration 写入租用覆盖层）。
+  // 播种前（无商品行）视为免费，向后兼容。
+  if (!(await isAvatarFree(avatar))) {
+    throw new ForbiddenError('该头像需在商城购买解锁', ErrorCode.AVATAR_LOCKED)
+  }
+
+  // 选免费头像即清除租用覆盖层（UserDecoration 持有记录保留，仅不再佩戴）
   const updated = await prisma.user.update({
     where: { id: userId },
-    data: { avatar },
-    select: {
-      id: true,
-      username: true,
-      email: true,
-      avatar: true,
-      bio: true,
-      level: true,
-      points: true,
-      stars: true,
-      role: true,
-      status: true,
-      oauthProvider: true,
-      createdAt: true,
-    },
+    data: { avatar, decorAvatarValue: null, decorAvatarExpireAt: null },
+    select: USER_PUBLIC_SELECT,
   })
 
   return { ...updated, status: updated.status as UserStatusType }

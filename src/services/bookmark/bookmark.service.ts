@@ -3,6 +3,7 @@ import { ErrorCode } from '../../constants/error-codes.js'
 import { NotFoundError, ConflictError, ValidationError } from '../../utils/errors.js'
 import { toListItem } from '../post/post-formatter.js'
 import type { PostListItem } from '../post/post-formatter.js'
+import { AUTHOR_SELECT } from '../user/user-decorator.js'
 
 /**
  * 帖子收藏服务。
@@ -83,7 +84,7 @@ export async function listBookmarks(
       include: {
         post: {
           include: {
-            author: { select: { id: true, username: true, avatar: true, level: true } },
+            author: { select: AUTHOR_SELECT },
           },
         },
       },

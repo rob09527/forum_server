@@ -69,14 +69,15 @@ export async function saveImage(userId: number, buffer: Buffer, mimetype: string
     throw new AppError('仅支持 JPG/PNG/GIF/WebP 图片', 400, ErrorCode.UPLOAD_INVALID_TYPE)
   }
 
-  // 5. 用户总上传量限制
+  // 5. 用户总上传量限制（基础额度 + 积分扩容额度 [1.4.2]）
   const user = await prisma.user.findUnique({
     where: { id: userId },
-    select: { uploadSize: true },
+    select: { uploadSize: true, uploadQuotaBonus: true },
   })
   const userTotal = user?.uploadSize ?? 0
-  if (userTotal + buffer.length > config.UPLOAD_MAX_USER_TOTAL_SIZE) {
-    const mb = Math.round(config.UPLOAD_MAX_USER_TOTAL_SIZE / 1024 / 1024)
+  const effectiveLimit = config.UPLOAD_MAX_USER_TOTAL_SIZE + (user?.uploadQuotaBonus ?? 0)
+  if (userTotal + buffer.length > effectiveLimit) {
+    const mb = Math.round(effectiveLimit / 1024 / 1024)
     throw new AppError(`上传总量已达上限（${mb}MB）`, 413, ErrorCode.UPLOAD_USER_TOTAL_EXCEEDED)
   }
 

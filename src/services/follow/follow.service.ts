@@ -9,6 +9,7 @@ import { NotificationType } from '../../constants/business.js'
 import { createAndPush } from '../notification/notification.service.js'
 import { toListItem } from '../post/post-formatter.js'
 import type { PostListItem } from '../post/post-formatter.js'
+import { AUTHOR_SELECT, toAuthorBrief, type AuthorRow } from '../user/user-decorator.js'
 
 /**
  * 关注服务。
@@ -27,6 +28,16 @@ export interface FollowUserItem {
   avatar: string | null
   /** 用户等级：claw | leg | meat */
   level: string
+  /** 生效中的用户名颜色渲染值；null 或已过期则不上色 [1.3.7] */
+  decorColorValue: string | null
+  /** 用户名颜色到期时间 */
+  decorColorExpireAt: Date | null
+  /** 生效中的称号文本；null 或已过期则无称号 */
+  decorTitleValue: string | null
+  /** 称号徽章配色 key，与 decorTitleValue 成对存储 */
+  decorTitleStyle: string | null
+  /** 称号到期时间 */
+  decorTitleExpireAt: Date | null
 }
 
 /** 分页结果 */
@@ -154,7 +165,7 @@ export async function getFollowingFeed(
     prisma.post.findMany({
       where,
       include: {
-        author: { select: { id: true, username: true, avatar: true, level: true } },
+        author: { select: AUTHOR_SELECT },
       },
       orderBy: [{ isPinned: 'desc' }, { createdAt: 'desc' }],
       skip: (page - 1) * safePageSize,
@@ -181,12 +192,7 @@ export async function isFollowing(followerId: number, followeeId: number): Promi
 }
 
 /** 关注/粉丝列表的关联用户摘要（followee/follower 同构） */
-interface RelationTargetUser {
-  id: number
-  username: string
-  avatar: string | null
-  level: string
-}
+interface RelationTargetUser extends AuthorRow {}
 
 /** 关注/粉丝列表共用查询。relation 为 'followee'（关注列表）或 'follower'（粉丝列表） */
 async function listRelations(
@@ -216,7 +222,7 @@ async function listRelations(
       include: {
         // 动态 include key（computed 属性）会让 TS 把 r[relation] 推断成 never，这里显式断言
         [relation]: {
-          select: { id: true, username: true, avatar: true, level: true },
+          select: AUTHOR_SELECT,
         },
       },
     }),
@@ -225,12 +231,7 @@ async function listRelations(
   return {
     items: rows.map((r) => {
       const u = r[relation] as RelationTargetUser
-      return {
-        id: u.id,
-        username: u.username,
-        avatar: u.avatar,
-        level: u.level,
-      }
+      return toAuthorBrief(u)
     }),
     page,
     pageSize: safePageSize,

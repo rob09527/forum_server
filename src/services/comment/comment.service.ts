@@ -1,10 +1,13 @@
 import { prisma } from '../../lib/prisma.js'
 import { ErrorCode } from '../../constants/error-codes.js'
 import { NotFoundError, ForbiddenError, ValidationError } from '../../utils/errors.js'
-import { PointType, UserRole, NotificationType } from '../../constants/business.js'
+import { PointType, UserRole, NotificationType, BountyStatus } from '../../constants/business.js'
 import { earnPoints } from '../points/points.service.js'
 import { createAndPush, notifyMentions } from '../notification/notification.service.js'
 import type { UserPublic } from '../auth/auth.service.js'
+import { AUTHOR_SELECT } from '../user/user-decorator.js'
+import { toAuthorBrief, type AuthorRow } from '../user/user-decorator.js'
+import type { AuthorBrief } from '../user/user-decorator.js'
 
 /** 评论创建请求 */
 export interface CreateCommentInput {
@@ -28,17 +31,12 @@ export interface CommentItem {
   floor: number | null
   /** 点赞数 */
   likeCount: number
-  /** 作者摘要 */
-  author: {
-    /** 作者 ID */
-    id: number
-    /** 用户名 */
-    username: string
-    /** 头像 URL */
-    avatar: string | null
-    /** 用户等级 */
-    level: string
-  }
+  /** 打赏笔数（冗余列，打赏时同事务增量维护，读零 JOIN） */
+  tipCount: number
+  /** 打赏总金额（鸡腿，冗余列） */
+  tipAmount: number
+  /** 作者摘要（含装饰生效槽，前端内联渲染） */
+  author: AuthorBrief
   /** 评论时间，ISO 8601 */
   createdAt: string
 }
@@ -73,10 +71,10 @@ export async function createComment(
     throw new ValidationError('评论内容不能为空', ErrorCode.COMMENT_CONTENT_TOO_SHORT)
   }
 
-  // 帖子必须存在（顺带取 authorId，供事务提交后发「评论了我的帖子」通知）
+  // 帖子必须存在（顺带取 authorId/bountyStatus：发「评论了我的帖子」通知 + 悬赏新回答提醒判定）
   const post = await prisma.post.findUnique({
     where: { id: postId },
-    select: { id: true, authorId: true },
+    select: { id: true, authorId: true, bountyStatus: true },
   })
   if (!post) {
     throw new NotFoundError('帖子', ErrorCode.POST_NOT_FOUND)
@@ -105,7 +103,7 @@ export async function createComment(
         const created = await tx.comment.create({
           data: { content, postId, authorId, parentId: input.parentId, floor: null },
           include: {
-            author: { select: { id: true, username: true, avatar: true, level: true } },
+            author: { select: AUTHOR_SELECT },
           },
         })
         const res = await earnPoints(authorId, PointType.COMMENT, { refId: created.id }, tx)
@@ -125,7 +123,7 @@ export async function createComment(
         const created = await tx.comment.create({
           data: { content, postId, authorId, parentId: null, floor },
           include: {
-            author: { select: { id: true, username: true, avatar: true, level: true } },
+            author: { select: AUTHOR_SELECT },
           },
         })
 
@@ -161,6 +159,17 @@ export async function createComment(
     createAndPush({
       userId: post.authorId,
       type: NotificationType.COMMENT,
+      actorId: authorId,
+      postId,
+    })
+  }
+
+  // 悬赏新回答提醒 [2.3]：帖子处于托管中（escrow）且顶层评论者非发起人时，
+  // 额外发 BOUNTY_REPLY 给发起人。仅顶层评论（才有资格成为有效回答 [1.6.2]），楼中楼不触发。
+  if (!input.parentId && post.bountyStatus === BountyStatus.ESCROW && post.authorId !== authorId) {
+    createAndPush({
+      userId: post.authorId,
+      type: NotificationType.BOUNTY_REPLY,
       actorId: authorId,
       postId,
     })
@@ -207,7 +216,7 @@ export async function listPostComments(
     where: { postId },
     orderBy: { createdAt: 'asc' },
     include: {
-      author: { select: { id: true, username: true, avatar: true, level: true } },
+      author: { select: AUTHOR_SELECT },
     },
   })
 
@@ -283,7 +292,7 @@ export async function updateComment(
     where: { id },
     data: { content: trimmed },
     include: {
-      author: { select: { id: true, username: true, avatar: true, level: true } },
+      author: { select: AUTHOR_SELECT },
     },
   })
 
@@ -326,8 +335,10 @@ type CommentWithAuthor = {
   parentId: number | null
   floor: number | null
   likeCount: number
+  tipCount: number
+  tipAmount: number
   createdAt: Date
-  author: { id: number; username: string; avatar: string | null; level: string }
+  author: AuthorRow
 }
 
 /** 将 Prisma Comment（含 author）转为列表项 */
@@ -339,12 +350,9 @@ function toItem(comment: CommentWithAuthor): CommentItem {
     parentId: comment.parentId,
     floor: comment.floor,
     likeCount: comment.likeCount,
-    author: {
-      id: comment.author.id,
-      username: comment.author.username,
-      avatar: comment.author.avatar,
-      level: comment.author.level,
-    },
+    tipCount: comment.tipCount,
+    tipAmount: comment.tipAmount,
+    author: toAuthorBrief(comment.author),
     createdAt: comment.createdAt.toISOString(),
   }
 }
