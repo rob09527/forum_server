@@ -5,8 +5,12 @@ import {
   adminAdjustPoints,
   adminResetPassword,
 } from '../services/admin/admin.service.js'
+import { adminRefundBounty } from '../services/bounty/bounty.service.js'
+import { sweepExpiredBounties } from '../services/bounty/bounty-sweep.js'
 import { deletePostById } from '../services/post/post.service.js'
 import { broadcastSystemNotification } from '../services/notification/notification.service.js'
+import { getAllConfigs, setConfig, resetConfig } from '../services/config/config.service.js'
+import type { ConfigGroup } from '../services/config/config.service.js'
 import { requireAdminKey } from '../middleware/admin-key.middleware.js'
 import { UserRole, UserStatus, SystemNotifyTarget } from '../constants/business.js'
 import type { SystemNotifyTargetType } from '../constants/business.js'
@@ -179,6 +183,111 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
         postId: body.postId ?? null,
       })
       sendSuccess(reply, result)
+    },
+  )
+
+  /**
+   * POST /api/admin/bounties/:id/refund
+   * 悬赏人工退款（处置异常悬赏 [2.4]）。Body: { operator?: string }（admin 后端会话透传的用户名）。
+   * forceRefund 语义在 service 内固定开启：无条件退款（跳过「是否有有效回答」判定），全额退给发起人，不抽水。
+   */
+  fastify.post(
+    '/api/admin/bounties/:id/refund',
+    {
+      preHandler: [requireAdminKey],
+      schema: {
+        body: {
+          type: 'object',
+          properties: { operator: { type: 'string', maxLength: 50 } },
+        },
+      },
+    },
+    async (request, reply) => {
+      const { id } = request.params as { id: string }
+      const { operator } = request.body as { operator?: string }
+      const bountyId = parseId(id)
+      await adminRefundBounty(bountyId, operator)
+      sendSuccess(reply, { id: bountyId })
+    },
+  )
+
+  /**
+   * POST /api/admin/bounties/sweep
+   * 手动触发超时结算（正常情况下 60s 调度器会自动跑，此接口用于验收/补扫）。
+   * 返回本次结算条数（0 表示已被其他实例抢占锁或本无到期悬赏）。
+   */
+  fastify.post(
+    '/api/admin/bounties/sweep',
+    {
+      preHandler: [requireAdminKey],
+    },
+    async (_request, reply) => {
+      const swept = await sweepExpiredBounties()
+      sendSuccess(reply, { swept })
+    },
+  )
+
+  /**
+   * GET /api/admin/config
+   * 读取 6 组配置的已解析生效值（zod 校验 + 默认兜底后的真实值），admin 表单据此初始化。
+   * 配置契约（key/schema/默认值）只存 forum 侧，admin 不再直连 Redis 手抄。
+   */
+  fastify.get(
+    '/api/admin/config',
+    { preHandler: [requireAdminKey] },
+    async (_request, reply) => {
+      sendSuccess(reply, await getAllConfigs())
+    },
+  )
+
+  /**
+   * PUT /api/admin/config/:group
+   * 写入一组配置（checkin | levels | shop | tip | bounty | props）。
+   * 先按本组 zod schema 校验，非法值返回 400 不落库；校验通过后直写共享 Redis。
+   */
+  fastify.put(
+    '/api/admin/config/:group',
+    {
+      preHandler: [requireAdminKey],
+      schema: {
+        params: {
+          type: 'object',
+          required: ['group'],
+          properties: {
+            group: { type: 'string', enum: ['checkin', 'levels', 'shop', 'tip', 'bounty', 'props'] },
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const { group } = request.params as { group: ConfigGroup }
+      await setConfig(group, request.body)
+      sendSuccess(reply, { group })
+    },
+  )
+
+  /**
+   * DELETE /api/admin/config/:group
+   * 恢复某组配置为默认值：删除 Redis key，forum 侧自动回退代码内置默认值。
+   */
+  fastify.delete(
+    '/api/admin/config/:group',
+    {
+      preHandler: [requireAdminKey],
+      schema: {
+        params: {
+          type: 'object',
+          required: ['group'],
+          properties: {
+            group: { type: 'string', enum: ['checkin', 'levels', 'shop', 'tip', 'bounty', 'props'] },
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const { group } = request.params as { group: ConfigGroup }
+      await resetConfig(group)
+      sendSuccess(reply, { group })
     },
   )
 }

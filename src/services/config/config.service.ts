@@ -2,6 +2,7 @@ import { z } from 'zod'
 import { redis } from '../../lib/redis.js'
 import { RedisKey } from '../../constants/redis-keys.js'
 import { UserLevel } from '../../constants/business.js'
+import { ValidationError } from '../../utils/errors.js'
 
 /**
  * 游戏化配置服务（签到奖励 / 等级体系）。
@@ -120,4 +121,221 @@ export async function getLevels(): Promise<LevelConfig[]> {
   const parsed = levelsSchema.safeParse(await readConfigJson(RedisKey.configLevels))
   if (!parsed.success) return DEFAULT_LEVELS
   return parsed.data
+}
+
+/**
+ * ── 消费侧配置（docs/积分消费体系.md 2.6）──
+ * 与签到/等级同构：admin 直写共享 Redis、forum 只读 + zod 校验 + 默认兜底。
+ * 商品价格/时效/上下架走 DB（shop_items），全局规则参数走 Redis。
+ */
+
+/** 商城配置 [2.6] */
+export interface ShopConfig {
+  /** 新购装饰默认时效天数（续费按各自 durationDays 叠加，此值为 UI 展示用兜底） */
+  defaultDurationDays: number
+  /** 到期前 N 天商城页横幅提醒 */
+  remindDays: number
+}
+
+/** 打赏配置 [2.6][1.5.3] */
+export interface TipConfig {
+  /** 快捷金额档位（前端快捷选择按钮） */
+  amounts: number[]
+  /** 自定义金额下限 */
+  customMin: number
+  /** 自定义金额上限 */
+  customMax: number
+  /** 日打赏总额上限（预留，null 表示不限制） */
+  dailyLimitPerUser: number | null
+  /** 打赏给帖子带来的热度加成基数 [1.5.4] */
+  heatBase: number
+  /** 热度加成上限 [1.5.4] */
+  heatCap: number
+}
+
+/** 悬赏配置 [2.6][1.6] */
+export interface BountyConfig {
+  /** 手续费率（结算时从赏金中扣走销毁，退款不抽水）[1.6.2] */
+  feeRate: number
+  /** 超时天数：托管后到期自动结算（判给最高赞 / 零回答退款）[1.6.3] */
+  timeoutDays: number
+  /** 悬赏金额下限 */
+  amountMin: number
+  /** 悬赏金额上限 */
+  amountMax: number
+  /** 发起门槛：累计获取积分下限（防新号刷悬赏）[1.8] */
+  minTotalEarned: number
+  /** 发起门槛：注册天数下限 [1.8] */
+  minRegisterDays: number
+  /** 单用户同时进行中的悬赏数上限 [1.8] */
+  maxActivePerUser: number
+}
+
+/** 功能道具配置 [2.6][1.4] */
+export interface PropsConfig {
+  /** 补签价格 [R52] */
+  makeupPrice: number
+  /** 每月补签次数上限 [1.4.2] */
+  makeupMonthlyLimit: number
+  /** 改名价格 [1.4.3] */
+  renamePrice: number
+  /** 改名冷却天数（两次改名间隔）[1.4.3] */
+  renameCooldownDays: number
+  /** 单次上传扩容体积（字节）[1.4.4] */
+  quotaPerPurchase: number
+  /** 上传扩容价格 [1.4.4] */
+  quotaPrice: number
+  /** 上传扩容累计上限（字节）[1.4.4] */
+  quotaTotalLimit: number
+}
+
+/** 默认商城配置 [2.6] */
+export const DEFAULT_SHOP_CONFIG: ShopConfig = {
+  defaultDurationDays: 30,
+  remindDays: 3,
+}
+
+/** 默认打赏配置 [2.6] */
+export const DEFAULT_TIP_CONFIG: TipConfig = {
+  amounts: [6, 66, 188],
+  customMin: 1,
+  customMax: 1000,
+  dailyLimitPerUser: null,
+  heatBase: 500,
+  heatCap: 500,
+}
+
+/** 默认悬赏配置 [2.6] */
+export const DEFAULT_BOUNTY_CONFIG: BountyConfig = {
+  feeRate: 0.1,
+  timeoutDays: 7,
+  amountMin: 50,
+  amountMax: 10000,
+  minTotalEarned: 0,
+  minRegisterDays: 0,
+  maxActivePerUser: 5,
+}
+
+/** 默认道具配置 [2.6] */
+export const DEFAULT_PROPS_CONFIG: PropsConfig = {
+  makeupPrice: 80,
+  makeupMonthlyLimit: 3,
+  renamePrice: 200,
+  renameCooldownDays: 30,
+  quotaPerPurchase: 10 * 1024 * 1024,
+  quotaPrice: 150,
+  quotaTotalLimit: 500 * 1024 * 1024,
+}
+
+const shopConfigSchema = z.object({
+  defaultDurationDays: z.number().int().min(1),
+  remindDays: z.number().int().min(0),
+})
+
+const tipConfigSchema = z.object({
+  amounts: z.array(z.number().int().min(1)).min(1),
+  customMin: z.number().int().min(1),
+  customMax: z.number().int().min(1),
+  dailyLimitPerUser: z.number().int().min(1).nullable(),
+  heatBase: z.number().int().min(0),
+  heatCap: z.number().int().min(0),
+})
+
+const bountyConfigSchema = z.object({
+  feeRate: z.number().min(0).max(1),
+  timeoutDays: z.number().int().min(1),
+  amountMin: z.number().int().min(1),
+  amountMax: z.number().int().min(1),
+  minTotalEarned: z.number().int().min(0),
+  minRegisterDays: z.number().int().min(0),
+  maxActivePerUser: z.number().int().min(1),
+})
+
+const propsConfigSchema = z.object({
+  makeupPrice: z.number().int().min(1),
+  makeupMonthlyLimit: z.number().int().min(1),
+  renamePrice: z.number().int().min(1),
+  renameCooldownDays: z.number().int().min(1),
+  quotaPerPurchase: z.number().int().min(1),
+  quotaPrice: z.number().int().min(1),
+  quotaTotalLimit: z.number().int().min(1),
+})
+
+/** 读取商城配置，Redis 缺失/非法/异常一律返回默认值 */
+export async function getShopConfig(): Promise<ShopConfig> {
+  const parsed = shopConfigSchema.safeParse(await readConfigJson(RedisKey.configShop))
+  if (!parsed.success) return DEFAULT_SHOP_CONFIG
+  return parsed.data
+}
+
+/** 读取打赏配置，Redis 缺失/非法/异常一律返回默认值 */
+export async function getTipConfig(): Promise<TipConfig> {
+  const parsed = tipConfigSchema.safeParse(await readConfigJson(RedisKey.configTip))
+  if (!parsed.success) return DEFAULT_TIP_CONFIG
+  return parsed.data
+}
+
+/** 读取悬赏配置，Redis 缺失/非法/异常一律返回默认值 */
+export async function getBountyConfig(): Promise<BountyConfig> {
+  const parsed = bountyConfigSchema.safeParse(await readConfigJson(RedisKey.configBounty))
+  if (!parsed.success) return DEFAULT_BOUNTY_CONFIG
+  return parsed.data
+}
+
+/** 读取道具配置，Redis 缺失/非法/异常一律返回默认值 */
+export async function getPropsConfig(): Promise<PropsConfig> {
+  const parsed = propsConfigSchema.safeParse(await readConfigJson(RedisKey.configProps))
+  if (!parsed.success) return DEFAULT_PROPS_CONFIG
+  return parsed.data
+}
+
+/**
+ * ── 配置写入口（服务端单一 owner，admin 改走 HTTP 转发）──
+ * 配置契约（Redis key 名 + zod schema + 默认值）只此一份，杜绝 admin 手抄漂移。
+ * admin 后端不再直连 Redis，统一经 /api/admin/config 读写。
+ */
+
+/** 配置组标识 */
+export type ConfigGroup = 'checkin' | 'levels' | 'shop' | 'tip' | 'bounty' | 'props'
+
+/** 组 → { Redis key, 校验 schema, 读取函数 }，set/get/reset 统一分发 */
+const CONFIG_GROUPS = {
+  checkin: { key: RedisKey.configCheckin, schema: checkinConfigSchema, get: getCheckinConfig },
+  levels: { key: RedisKey.configLevels, schema: levelsSchema, get: getLevels },
+  shop: { key: RedisKey.configShop, schema: shopConfigSchema, get: getShopConfig },
+  tip: { key: RedisKey.configTip, schema: tipConfigSchema, get: getTipConfig },
+  bounty: { key: RedisKey.configBounty, schema: bountyConfigSchema, get: getBountyConfig },
+  props: { key: RedisKey.configProps, schema: propsConfigSchema, get: getPropsConfig },
+} as const satisfies Record<ConfigGroup, { key: string; schema: z.ZodTypeAny; get: () => Promise<unknown> }>
+
+/** 6 组配置的已解析生效值（zod 校验 + 默认兜底后的真实值，admin 表单据此初始化） */
+export async function getAllConfigs() {
+  const [checkin, levels, shop, tip, bounty, props] = await Promise.all([
+    getCheckinConfig(),
+    getLevels(),
+    getShopConfig(),
+    getTipConfig(),
+    getBountyConfig(),
+    getPropsConfig(),
+  ])
+  return { checkin, levels, shop, tip, bounty, props }
+}
+
+/** 写入一组配置：先 zod 校验再落 Redis，非法值直接抛 400，不写脏数据 */
+export async function setConfig(group: ConfigGroup, value: unknown): Promise<void> {
+  const entry = CONFIG_GROUPS[group]
+  if (!entry) throw new ValidationError('不支持的配置组')
+  const parsed = entry.schema.safeParse(value)
+  if (!parsed.success) {
+    const detail = parsed.error.issues.map((i) => `${i.path.join('.') || '值'} ${i.message}`).join('；')
+    throw new ValidationError(`配置「${group}」校验失败：${detail}`)
+  }
+  await redis.set(entry.key, JSON.stringify(parsed.data))
+}
+
+/** 删除一组配置：forum 侧自动回退代码内置默认值 */
+export async function resetConfig(group: ConfigGroup): Promise<void> {
+  const entry = CONFIG_GROUPS[group]
+  if (!entry) throw new ValidationError('不支持的配置组')
+  await redis.del(entry.key)
 }
