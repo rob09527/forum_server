@@ -57,3 +57,13 @@ export class InvalidCredentialsError extends AppError {
     super('邮箱或密码错误', 401, ErrorCode.INVALID_CREDENTIALS)
   }
 }
+
+/**
+ * 余额不足。由 spendPoints 的条件更新（WHERE points >= amount 命中 0 行）抛出 [R44][1.8]。
+ * message 拼「余额不足，还差 N 🍗」，前端据 code 弹「去签到 →」引导（产品 1.10）。
+ */
+export class InsufficientPointsError extends AppError {
+  constructor(have: number, needed: number) {
+    super(`余额不足，还差 ${needed - have} 🍗`, 400, ErrorCode.INSUFFICIENT_POINTS)
+  }
+}

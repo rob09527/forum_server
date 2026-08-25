@@ -70,6 +70,36 @@ model User {
   /// 上次签到时间，用于判断是否断签 [R13]
   lastCheckinAt DateTime?
 
+  // ── 装饰生效槽（消费体系，见 docs/积分消费体系.md）──
+  // 反规范化的「当前生效」状态：单槽模型（同类每人只保留一个）等价于用户表上一个列槽位，
+  // 全站用户名渲染点零 JOIN 直接读 [1.2][1.3.3]
+
+  /// 生效中的用户名颜色渲染值（CSS 色值或渐变，如 #a855f7）；未持有为 null [R44]
+  /// 购买时从 ShopItem.renderValue 快照而来，商品事后改价/改值/下架均不影响本列 [1.3.3]
+  decorColorValue     String?
+
+  /// 用户名颜色到期时间；渲染时内联判定 now < 本列才生效，过期不清空（靠时间判定，零清理成本）[R46]
+  decorColorExpireAt  DateTime?
+
+  /// 生效中的专属称号文本（如「卷王」）；未持有为 null
+  decorTitleValue     String?
+
+  /// 称号徽章配色 key（amber | violet | emerald …），与 decorTitleValue 成对存储
+  decorTitleStyle     String?
+
+  /// 称号到期时间，语义同 decorColorExpireAt
+  decorTitleExpireAt  DateTime?
+
+  /// 生效中的租用头像路径（付费头像快照，/avatars/{style}/avatar-{nn}.svg）；未租用为 null
+  decorAvatarValue     String?
+
+  /// 租用头像到期时间；过期不清空，渲染时折叠回 User.avatar（基础头像），靠时间判定 [R46]
+  decorAvatarExpireAt  DateTime?
+
+  /// 上传配额加购字节数（扩容道具累加，永久有效）；
+  /// 实际配额 = config.UPLOAD_MAX_USER_TOTAL_SIZE + 本列，见 upload.service 校验 [1.4.2]
+  uploadQuotaBonus    Int       @default(0)
+
   /// 积分流水记录
   pointLogs     PointLog[]
 
@@ -148,6 +178,20 @@ model Post {
   /// 热度分（物化列：likeCount*300 + commentCount*200 + viewCount，点赞/评论/浏览写路径增量维护）
   heatScore    Int       @default(0)
 
+  // ── 消费体系冗余列（见 docs/积分消费体系.md，写路径增量维护、读路径零聚合）──
+
+  /// 打赏人数（冗余；因 [R48] 一人一次，人数 = 笔数，展示无需去重）[1.4]
+  tipCount     Int       @default(0)
+
+  /// 打赏总额（冗余；详情页「共 328」直接读，不做 SUM 聚合）[1.4]
+  tipAmount    Int       @default(0)
+
+  /// 悬赏金额；null 表示非悬赏帖。列表徽章靠本列渲染，避免列表页 JOIN bounties [1.5]
+  bountyAmount Int?
+
+  /// 悬赏状态（同 Bounty.status 的冗余）；null 表示非悬赏帖。用于列表筛选「待解决的悬赏」[1.5]
+  bountyStatus String?
+
   /// 是否置顶，置顶帖列表优先展示（admin 模块后续提供置顶 API）
   isPinned     Boolean   @default(false)
 
@@ -176,6 +220,8 @@ model Post {
   // 热度窗口扫描：索引服务 hot 列表的 WHERE createdAt >= 7d 范围过滤；排序首键 isPinned 无法并入本索引，
   // 残余 isPinned+heatScore 排序为有界窗口内小集合显式排序（可接受，已消除全量拉回内存 JS 排序）
   @@index([createdAt, heatScore(sort: Desc)])
+  /// 悬赏聚合入口：筛选托管中的悬赏帖 + 时间倒序 [1.5]
+  @@index([bountyStatus, createdAt(sort: Desc)])
   @@map("posts")
 }
 
@@ -213,6 +259,12 @@ model Comment {
 
   /// 点赞数（冗余字段，点赞时更新）
   likeCount Int       @default(0)
+
+  // ── 消费体系冗余列（见 docs/积分消费体系.md）──
+  /// 打赏人数（冗余；评论区轻量展示 🍗 3）[1.4]
+  tipCount   Int       @default(0)
+  /// 打赏总额（冗余）[1.4]
+  tipAmount  Int       @default(0)
 
   /// 评论时间
   createdAt DateTime  @default(now())
@@ -314,6 +366,8 @@ model PointLog {
   createdAt    DateTime @default(now())
 
   @@index([userId, createdAt(sort: Desc)])
+  /// 按类型派生限流（补签月次数、改名冷却）+ 后台按类型统计各出口消费占比 [1.6]
+  @@index([userId, type, createdAt(sort: Desc)])
   @@map("point_logs")
 }
 
@@ -520,4 +574,185 @@ model NotificationMessage {
   createdAt DateTime @default(now())
 
   @@map("notification_messages")
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// 消费体系模型（规则来源 docs/积分消费体系.md，编号 [R44] 起）
+// ══════════════════════════════════════════════════════════════════════
+
+/// 装饰商品目录（后台 CRUD 维护，前台只读）[1.3]
+model ShopItem {
+  /// 商品 ID
+  id           Int      @id @default(autoincrement())
+
+  /// 装饰类型：username_color(用户名颜色) | title(专属称号)，同类互相覆盖、不同类共存 [1.3.3]
+  type         String
+
+  /// 商品名（前台展示，如「幻紫」）
+  name         String
+
+  /// 渲染值：颜色类为 CSS 色值/渐变；称号类为称号文本。购买时快照到 UserDecoration 与 User 槽位
+  renderValue  String
+
+  /// 附加样式 key（称号徽章配色）；颜色类为 null
+  renderStyle  String?
+
+  /// 价格（鸡腿），改价不影响已售出 [2.2]
+  price        Int
+
+  /// 时效天数（入门色 7 / 精选色与称号 30）[1.7]
+  durationDays Int
+
+  /// 是否上架；下架后商城隐藏、不可购买，已持有者不受影响 [2.2]
+  isActive     Boolean  @default(true)
+
+  /// 排序权重，越小越靠前
+  sortOrder    Int      @default(0)
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  /// 商城列表：按类型分组 + 只看上架 + 排序
+  @@index([type, isActive, sortOrder])
+  @@map("shop_items")
+}
+
+/// 用户装饰持有记录（续费入口 + 客诉查询依据）
+/// 与 User 上的生效槽的分工：槽位是「当前生效的那一个」，本表是「买过的每一个」[1.3]
+model UserDecoration {
+  /// 持有记录 ID
+  id                Int      @id @default(autoincrement())
+
+  /// 持有用户 ID
+  userId            Int
+
+  /// 商品 ID；续费需要跳回商品，故商品禁删只能下架 [2.2]
+  itemId            Int
+
+  /// 装饰类型（冗余自 ShopItem.type，「我的装饰」按类型分组时免 JOIN）
+  type              String
+
+  /// 购买时快照的渲染值 —— 商品事后改动不回溯已购用户 [1.3.3]
+  renderValue       String
+
+  /// 购买时快照的样式 key
+  renderStyle       String?
+
+  /// 实付价格快照（后台客诉排查「我当时花了多少」）
+  price             Int
+
+  /// 本次生效起始时间
+  startAt           DateTime
+
+  /// 到期时间；过期记录不删除 [R46]，置灰展示 + 一键续费
+  expireAt          DateTime
+
+  /// 到期通知已发送的时间；null 表示未发。到期提醒的幂等标记 [T2]，
+  /// 不用 Redis —— 丢了会重复轰炸用户，「只应发生一次」的标记必须持久化
+  expiredNotifiedAt DateTime?
+
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  /// 一个用户对同一商品只有一行，续费=延长 expireAt，避免「我的」列表堆积历史行
+  @@unique([userId, itemId])
+
+  /// 「我的装饰」按用户查、按到期时间倒序
+  @@index([userId, type, expireAt(sort: Desc)])
+
+  /// 后台按商品查持有者 + 商品删除守卫的存在性检查 [2.2][2.3]
+  @@index([itemId])
+  @@map("user_decorations")
+}
+
+/// 打赏记录（账本；不可撤销、不追溯 [R53]）
+model Tip {
+  /// 打赏记录 ID
+  id         Int      @id @default(autoincrement())
+
+  /// 打赏者 ID
+  fromUserId Int
+
+  /// 接收者 ID（内容作者）。冗余存储而非 JOIN 内容表取 —— 内容删除后仍要能按接收方聚合 [T4][2.5]
+  toUserId   Int
+
+  /// 打赏目标类型：post | comment
+  targetType String
+
+  /// 目标 ID。裸 ID 不建外键 —— 账务记录的生命周期独立于业务内容 [T4]，
+  /// 与 PointLog.refId 同口径。内容删除后本行保留，后台按「内容已删除」渲染
+  targetId   Int
+
+  /// 打赏金额（鸡腿）；不抽水，全额到账 [R47]
+  amount     Int
+
+  /// 打赏留言，最长 20 字，选填 [1.5.3]
+  message    String?
+
+  createdAt  DateTime @default(now())
+
+  /// [R48] 每人每个内容只能打赏一次。三列均非空，PG 唯一约束天然生效（不可用可空 postId 表达，见 T6）
+  /// 同时承担并发重复提交的幂等兜底
+  @@unique([fromUserId, targetType, targetId])
+
+  /// 帖子/评论详情的打赏者列表（按时间倒序）
+  @@index([targetType, targetId, createdAt(sort: Desc)])
+
+  /// 后台按发送方聚合 —— 排查小号搬运的第一入口 [2.5]
+  @@index([fromUserId, createdAt(sort: Desc)])
+
+  /// 后台按接收方聚合
+  @@index([toUserId, createdAt(sort: Desc)])
+  @@map("tips")
+}
+
+/// 悬赏记录（一帖一悬赏）[1.5]
+model Bounty {
+  /// 悬赏 ID
+  id                Int       @id @default(autoincrement())
+
+  /// 悬赏帖 ID。裸 ID 不建外键（同 Tip，见 T4）；一帖一悬赏故唯一
+  postId            Int       @unique
+
+  /// 发起人 ID
+  userId            Int
+
+  /// 托管金额。发起时已从发起人余额一次性扣除，托管金不落在任何用户账户，仅作记账存在 [1.6.2]
+  amount            Int
+
+  /// 状态：escrow(托管中) | settled(已采纳) | refunded(已退款)。状态流转一律条件更新，保证幂等 [1.6.2]
+  status            String    @default("escrow")
+
+  /// 超时时间 = 发起时刻 + 配置天数（默认 7）。定时结算的判定依据 [1.6.3]
+  expireAt          DateTime
+
+  /// 被采纳的回答评论 ID（结算快照）；该评论事后被删不影响已结算状态 [1.6.6]
+  acceptedCommentId Int?
+
+  /// 被采纳的回答者 ID（结算快照）
+  acceptedUserId    Int?
+
+  /// 实发金额 = amount − fee；退款时为 null
+  payout            Int?
+
+  /// 手续费（销毁，计入悬赏账目）[1.6.2]；退款不抽水，故退款时为 null [1.6.2]
+  fee               Int?
+
+  /// 结算方式：accept(人工采纳) | auto(超时自动判给最高赞) | cancel(发起人取消) | admin(后台人工退款)
+  settleType        String?
+
+  /// 结算时间；未结算为 null
+  settledAt         DateTime?
+
+  /// 后台人工退款的操作者用户名（审计追责，与 PointLog.operator 同口径）[2.4]
+  operator          String?
+
+  createdAt         DateTime  @default(now())
+
+  /// 定时扫描的驱动索引：捞出「仍托管中 且 已到期」的悬赏 [2.4]
+  @@index([status, expireAt])
+
+  /// 发起门槛校验：单用户同时进行中的悬赏数上限 [1.8]
+  @@index([userId, status])
+  @@map("bounties")
 }

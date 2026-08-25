@@ -74,8 +74,15 @@ export const SortOrder = {
 } as const
 export type SortOrderType = (typeof SortOrder)[keyof typeof SortOrder]
 
-/** 积分变动类型 */
+/**
+ * 积分变动类型。收入侧见《积分签到等级体系.md》，消费侧见《积分消费体系.md》[R45]。
+ * 三种通道各走各的写入函数，类型别名在下方按通道拆分，防止误用：
+ * - earnPoints（收入）：同增余额与累计、可能升级
+ * - spendPoints（消费）：只扣余额，永不触碰累计 [R44]
+ * - creditPoints（转入）：只加余额，不计累计、不升级 [R50]
+ */
 export const PointType = {
+  // ── 收入侧（存量，走 earnPoints，同时增加余额与累计）──
   /** 签到奖励 */
   CHECKIN: 'checkin',
   /** 发帖奖励 */
@@ -86,8 +93,53 @@ export const PointType = {
   LIKED: 'liked',
   /** 积分转账 */
   TRANSFER: 'transfer',
+
+  // ── 消费侧：扣余额，走 spendPoints，永不触碰累计 [R44] ──
+  /** 装饰购买 / 续费 */
+  SHOP: 'shop',
+  /** 补签 [R52]（只扣分，不补发该日签到积分） */
+  MAKEUP: 'makeup',
+  /** 改名 */
+  RENAME: 'rename',
+  /** 上传扩容 */
+  QUOTA: 'quota',
+  /** 打赏支出 [R47] */
+  TIP_OUT: 'tip_out',
+  /** 悬赏托管扣款 */
+  BOUNTY_OUT: 'bounty_out',
+
+  // ── 转入侧：加余额，走 creditPoints，不计累计、不升级 [R50] ──
+  /** 打赏收入 */
+  TIP_IN: 'tip_in',
+  /** 悬赏奖励到账（已扣除手续费） */
+  BOUNTY_IN: 'bounty_in',
+  /** 悬赏退款（零回答 / 发起人取消 / 后台人工退款，不抽水） */
+  BOUNTY_REFUND: 'bounty_refund',
 } as const
 export type PointTypeType = (typeof PointType)[keyof typeof PointType]
+
+/** 收入侧积分类型：走 earnPoints，同时增加余额与累计、可能升级 [2.1] */
+export type IncomePointType =
+  | typeof PointType.CHECKIN
+  | typeof PointType.POST
+  | typeof PointType.COMMENT
+  | typeof PointType.LIKED
+  | typeof PointType.TRANSFER
+
+/** 消费侧积分类型：走 spendPoints，只扣余额、永不触碰累计 [R44] */
+export type SpendPointType =
+  | typeof PointType.SHOP
+  | typeof PointType.MAKEUP
+  | typeof PointType.RENAME
+  | typeof PointType.QUOTA
+  | typeof PointType.TIP_OUT
+  | typeof PointType.BOUNTY_OUT
+
+/** 转入侧积分类型：走 creditPoints，只加余额、不计累计、不升级 [R50] */
+export type CreditPointType =
+  | typeof PointType.TIP_IN
+  | typeof PointType.BOUNTY_IN
+  | typeof PointType.BOUNTY_REFUND
 
 /** 用户管理角色 */
 export const UserRole = {
@@ -111,7 +163,8 @@ export const UserStatus = {
 } as const
 export type UserStatusType = (typeof UserStatus)[keyof typeof UserStatus]
 
-/** 允许的头像风格（本地预置头像目录，对应前端 public/avatars/ 子目录） */
+/** 允许的头像风格（本地预置头像目录，对应前端 public/avatars/ 子目录）。
+ * 已弃用风格（croodles-neutral 涂鸦2 / notionists-neutral 印象2）头像文件已删除，不再允许。 */
 export const ALLOWED_AVATAR_STYLES = [
   'bottts-neutral',
   'avataaars',
@@ -125,12 +178,10 @@ export const ALLOWED_AVATAR_STYLES = [
   'big-ears-neutral',
   'big-smile',
   'croodles',
-  'croodles-neutral',
   'fun-emoji',
   'micah',
   'miniavs',
   'notionists',
-  'notionists-neutral',
   'open-peeps',
   'personas',
 ] as const
@@ -182,6 +233,14 @@ export const NotificationType = {
   SYSTEM: 'system',
   /** 帖子/评论中 @ 提到了我（编辑器点选插入的结构化 mention） */
   MENTION: 'mention',
+  /** 有人打赏我的帖子/评论（聚合：同一目标合并一条、actor 累加 [1.5.3]） */
+  TIP: 'tip',
+  /** 悬赏帖收到新回答，提醒发起人采纳 [1.6.5]（聚合：同帖合并、actor 累加） */
+  BOUNTY_REPLY: 'bounty_reply',
+  /** 悬赏已结算（采纳或超时判给；含被采纳者「获得 N🍗」）[1.6.5]（聚合：同帖合并） */
+  BOUNTY_SETTLED: 'bounty_settled',
+  /** 悬赏已退款（零有效回答 / 发起人取消 / 后台处置）[1.6.5]（聚合：同帖合并） */
+  BOUNTY_REFUNDED: 'bounty_refunded',
 } as const
 export type NotificationTypeType = (typeof NotificationType)[keyof typeof NotificationType]
 
@@ -195,3 +254,56 @@ export const SystemNotifyTarget = {
   USERS: 'users',
 } as const
 export type SystemNotifyTargetType = (typeof SystemNotifyTarget)[keyof typeof SystemNotifyTarget]
+
+/** 装饰商品类型。同类互相覆盖（单槽）、不同类共存 [1.3.3] */
+export const ShopItemType = {
+  /** 用户名颜色（CSS 色值/渐变） */
+  USERNAME_COLOR: 'username_color',
+  /** 专属称号（文本 + 徽章配色 key） */
+  TITLE: 'title',
+  /** 头像（renderValue = /avatars/{style}/avatar-{nn}.svg，付费租用覆盖基础头像） */
+  AVATAR: 'avatar',
+} as const
+export type ShopItemTypeType = (typeof ShopItemType)[keyof typeof ShopItemType]
+
+/** 称号徽章配色 key（对应 Tailwind class 前缀，admin 上架时填写，与前端 UsernameText 联动）[1.3.2] */
+export const DecorationStyle = {
+  /** 琥珀 */
+  AMBER: 'amber',
+  /** 紫罗兰 */
+  VIOLET: 'violet',
+  /** 祖母绿 */
+  EMERALD: 'emerald',
+} as const
+export type DecorationStyleType = (typeof DecorationStyle)[keyof typeof DecorationStyle]
+
+/** 悬赏状态机。状态流转一律条件更新（updateMany where status='escrow'），保证并发幂等 [2.5.3] */
+export const BountyStatus = {
+  /** 托管中：钱已扣、悬而未决，等待采纳或超时 */
+  ESCROW: 'escrow',
+  /** 已结算：采纳或超时判给，回答者已得款 */
+  SETTLED: 'settled',
+  /** 已退款：零有效回答 / 发起人取消 / 后台处置，全额退回发起人 */
+  REFUNDED: 'refunded',
+} as const
+export type BountyStatusType = (typeof BountyStatus)[keyof typeof BountyStatus]
+
+/** 悬赏状态中文名（后台列表与通知展示用） */
+export const BountyStatusLabel: Record<BountyStatusType, string> = {
+  [BountyStatus.ESCROW]: '托管中',
+  [BountyStatus.SETTLED]: '已采纳',
+  [BountyStatus.REFUNDED]: '已退款',
+}
+
+/** 悬赏结算方式（settleType 取值，记录在 bounties 表用于后台审计） */
+export const BountySettleType = {
+  /** 发起人人工采纳 [1.6.5] */
+  ACCEPT: 'accept',
+  /** 超时自动判给最高赞 / 零回答自动退款 [1.6.3] */
+  AUTO: 'auto',
+  /** 发起人取消（仅无有效回答时允许）[1.6.2] */
+  CANCEL: 'cancel',
+  /** 后台人工处置（退款）[2.5.5] */
+  ADMIN: 'admin',
+} as const
+export type BountySettleTypeType = (typeof BountySettleType)[keyof typeof BountySettleType]

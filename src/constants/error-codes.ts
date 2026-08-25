@@ -38,6 +38,46 @@ export const ErrorCode = {
   // ── 签到 ──
   /** 今天已经签到过了 */
   ALREADY_CHECKED_IN: 'ALREADY_CHECKED_IN',
+  /** 补签不可用（今天已签/昨天已签/断签超 1 天） */
+  MAKEUP_UNAVAILABLE: 'MAKEUP_UNAVAILABLE',
+  /** 本月补签次数已达上限 */
+  MAKEUP_LIMIT_EXCEEDED: 'MAKEUP_LIMIT_EXCEEDED',
+
+  // ── 积分消费 ──
+  /** 余额不足（InsufficientPointsError，附带还差 N 🍗） */
+  INSUFFICIENT_POINTS: 'INSUFFICIENT_POINTS',
+  /** 改名冷却中（RENAME_COOLDOWN 天 1 次） */
+  RENAME_COOLDOWN: 'RENAME_COOLDOWN',
+  /** 上传扩容已达总量上限 */
+  QUOTA_LIMIT_EXCEEDED: 'QUOTA_LIMIT_EXCEEDED',
+
+  // ── 装饰商城 ──
+  /** 商品不存在 */
+  ITEM_NOT_FOUND: 'ITEM_NOT_FOUND',
+  /** 商品已下架 */
+  ITEM_NOT_ACTIVE: 'ITEM_NOT_ACTIVE',
+  /** 该头像需在商城购买解锁（付费头像未持有） */
+  AVATAR_LOCKED: 'AVATAR_LOCKED',
+  /** 免费池头像不可购买（永久有效，直接在个人资料选择） */
+  AVATAR_FREE_PURCHASE: 'AVATAR_FREE_PURCHASE',
+
+  // ── 打赏 ──
+  /** 该内容已经打赏过了（每人每内容一次 [R48]） */
+  ALREADY_TIPPED: 'ALREADY_TIPPED',
+  /** 不能打赏自己的内容 [R49] */
+  CANNOT_TIP_SELF: 'CANNOT_TIP_SELF',
+  /** 打赏金额不在允许区间（或超出日额度） */
+  TIP_AMOUNT_INVALID: 'TIP_AMOUNT_INVALID',
+
+  // ── 悬赏 ──
+  /** 悬赏金额不在配置区间 */
+  BOUNTY_AMOUNT_INVALID: 'BOUNTY_AMOUNT_INVALID',
+  /** 同时进行的悬赏数已达上限 */
+  BOUNTY_LIMIT_EXCEEDED: 'BOUNTY_LIMIT_EXCEEDED',
+  /** 悬赏已结算/已有有效回答（取消/采纳失败） */
+  BOUNTY_ALREADY_SETTLED: 'BOUNTY_ALREADY_SETTLED',
+  /** 采纳对象必须是该帖的有效回答（顶层且非发起人自答） */
+  BOUNTY_ACCEPT_INVALID: 'BOUNTY_ACCEPT_INVALID',
 
   // ── 帖子 ──
   /** 帖子不存在 */

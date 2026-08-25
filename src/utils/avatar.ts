@@ -23,3 +23,23 @@ export function deterministicLocalAvatar(username: string): string {
   const n = (idx % AVATARS_PER_STYLE) + 1
   return `/avatars/${style}/avatar-${String(n).padStart(2, '0')}.svg`
 }
+
+/**
+ * 折叠「生效头像」：租用的付费头像覆盖层未过期时优先，否则回退基础头像。
+ * 所有后端投影（AuthorBrief / UserPublic / UserProfile 等）在映射 avatar 时统一调用，
+ * 前端仍只读 avatar 字段，无需感知双槽。
+ * @param avatar 基础（免费）头像
+ * @param decorAvatarValue 租用头像路径快照（User.decorAvatarValue）
+ * @param decorAvatarExpireAt 租用头像到期时间
+ */
+export function effectiveAvatar(
+  avatar: string | null,
+  decorAvatarValue: string | null,
+  decorAvatarExpireAt: Date | null,
+  now = new Date(),
+): string | null {
+  if (decorAvatarValue && decorAvatarExpireAt && decorAvatarExpireAt.getTime() > now.getTime()) {
+    return decorAvatarValue
+  }
+  return avatar
+}

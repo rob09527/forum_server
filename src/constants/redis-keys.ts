@@ -65,4 +65,32 @@ export const RedisKey = {
    * 未配置/非法时用 config.service 的 DEFAULT_LEVELS。
    */
   configLevels: 'config:levels',
+  /**
+   * 商城配置（JSON 字符串），admin 直写共享 Redis，forum 只读 + 默认兜底 [2.6]。
+   * 未配置/非法时用 config.service 的 DEFAULT_SHOP_CONFIG。
+   */
+  configShop: 'config:shop',
+  /**
+   * 打赏配置（JSON 字符串），admin 直写共享 Redis，forum 只读 + 默认兜底 [2.6]。
+   * 未配置/非法时用 config.service 的 DEFAULT_TIP_CONFIG。
+   */
+  configTip: 'config:tip',
+  /**
+   * 悬赏配置（JSON 字符串），admin 直写共享 Redis，forum 只读 + 默认兜底 [2.6]。
+   * 未配置/非法时用 config.service 的 DEFAULT_BOUNTY_CONFIG。
+   */
+  configBounty: 'config:bounty',
+  /**
+   * 功能道具配置（JSON 字符串），admin 直写共享 Redis，forum 只读 + 默认兜底 [2.6]。
+   * 未配置/非法时用 config.service 的 DEFAULT_PROPS_CONFIG。
+   */
+  configProps: 'config:props',
+
+  // ── 悬赏 ──
+  /** 悬赏超时结算的分布式锁（SET NX EX 60）。保证多实例只有一个执行 sweep [2.5.3] */
+  bountySweepLock: 'bounty:sweep:lock',
+
+  // ── 装饰 ──
+  /** 装饰到期提醒的分布式锁（SET NX EX 60）。保证多实例只有一个扫描今日到期 [T2] */
+  decorationRemindLock: 'decoration:remind:lock',
 } as const
