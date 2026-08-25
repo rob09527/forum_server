@@ -3,6 +3,9 @@ import { prisma } from '../../lib/prisma.js'
 import { redis } from '../../lib/redis.js'
 import { RedisKey } from '../../constants/redis-keys.js'
 import { PointType, UserLevel } from '../../constants/business.js'
+import type { IncomePointType, SpendPointType, CreditPointType } from '../../constants/business.js'
+import { ErrorCode } from '../../constants/error-codes.js'
+import { ValidationError, InsufficientPointsError } from '../../utils/errors.js'
 import { getLevels } from '../config/config.service.js'
 import type { LevelConfig } from '../config/config.service.js'
 
@@ -16,8 +19,14 @@ import type { LevelConfig } from '../config/config.service.js'
  * - totalPointsEarned（累计）：只增不减，决定等级 [R20]
  */
 
+/**
+ * 全量积分类型（含消费/转入），spendPoints/creditPoints 的入参口径 [R45]。
+ * 单通道的细分类型 IncomePointType/SpendPointType/CreditPointType 见 constants/business.ts。
+ */
+export type PointTypeValue = (typeof PointType)[keyof typeof PointType]
+
 /** 可通过行为获取的积分类型（transfer 仅用于未来转账，不参与自动发放） */
-export type PointTypeValue = Exclude<(typeof PointType)[keyof typeof PointType], typeof PointType.TRANSFER>
+export type EarnablePointType = Exclude<IncomePointType, typeof PointType.TRANSFER>
 
 /**
  * 各行为积分定价与当日次数上限。
@@ -25,7 +34,7 @@ export type PointTypeValue = Exclude<(typeof PointType)[keyof typeof PointType],
  * [R2] 评论 +3，当日最多 10 次有分（上限 30）
  * [R3] 被赞 +1，被动收入天然受限，不设次数上限
  */
-const POINT_RULES: Record<PointTypeValue, { delta: number; dailyTimes?: number }> = {
+const POINT_RULES: Record<EarnablePointType, { delta: number; dailyTimes?: number }> = {
   [PointType.CHECKIN]: { delta: 0 }, // 签到得分由 checkin.service 按连续规则实时计算，不走固定值
   [PointType.POST]: { delta: 10, dailyTimes: 3 },
   [PointType.COMMENT]: { delta: 3, dailyTimes: 10 },
@@ -59,7 +68,7 @@ export interface EarnPointsOptions {
  */
 export async function earnPoints(
   userId: number,
-  type: PointTypeValue,
+  type: EarnablePointType,
   options: EarnPointsOptions = {},
   tx?: Prisma.TransactionClient,
 ): Promise<EarnResult> {
@@ -161,4 +170,100 @@ export function formatDateKey(date: Date): string {
   const m = String(date.getMonth() + 1).padStart(2, '0')
   const d = String(date.getDate()).padStart(2, '0')
   return `${y}-${m}-${d}`
+}
+
+/**
+ * ── 积分三通道（消费侧，docs/积分消费体系.md 2.1）──
+ * | 通道 | 动 points | 动 totalPointsEarned | 可能升级 | 用途 |
+ * | earnPoints（存量） | + | + | 是 | 收入侧 |
+ * | spendPoints（新增） | −（条件更新） | 不动 [R44] | 否 | 一切消费出口 |
+ * | creditPoints（新增） | + | 不动 [R50] | 否 | 打赏收入 / 悬赏奖励 / 悬赏退款 |
+ *
+ * [R51] 消费与打赏行为本身不产生积分：三个通道里没有任何「消费回馈」出口。
+ * 防套利的机制性保证就是「这条链路上没有 earnPoints 可调」。
+ */
+
+/** 消费/转入流水选项 */
+export interface SpendPointsOptions {
+  /** 关联业务 ID（商品/帖子/评论/悬赏），用于流水溯源 [R45] */
+  refId?: number
+}
+
+/**
+ * 消费扣款。并发守卫：余额充足写在 WHERE 条件里，而不是先查余额再更新 [1.8][R44]。
+ * - 条件更新 `updateMany({ where: { id, points: { gte: amount } } })`：两个并发请求只有一个能命中 WHERE
+ * - 命中 0 行 → 重读余额抛 InsufficientPointsError（「还差 N 🍗」，前端引导去签到）
+ * - 同事务内重读余额写流水，balanceAfter 不会串线 [R42][R45]
+ *
+ * 必须在调用方事务内执行（传 tx），否则「扣款成功但业务表没写」会撕裂对账。
+ */
+export async function spendPoints(
+  userId: number,
+  type: SpendPointType,
+  amount: number,
+  options: SpendPointsOptions = {},
+  tx?: Prisma.TransactionClient,
+): Promise<void> {
+  const db = tx ?? prisma
+  if (!Number.isInteger(amount) || amount <= 0) {
+    throw new ValidationError('消费金额必须是正整数')
+  }
+
+  // 条件更新：points >= amount 才减。并发双花在这里被数据库行锁天然拦截
+  const res = await db.user.updateMany({
+    where: { id: userId, points: { gte: amount } },
+    data: { points: { decrement: amount } },
+  })
+  if (res.count === 0) {
+    // 余额不足：再查一次当前余额，报「还差 N」供前端引导（产品 1.10）
+    const u = await db.user.findUnique({ where: { id: userId }, select: { points: true } })
+    const have = u?.points ?? 0
+    throw new InsufficientPointsError(have, amount)
+  }
+
+  // 同事务内重读余额写流水。行锁已由上面的 updateMany 持有，
+  // 这里读到的必然是本事务扣款后的值，balanceAfter 不会串线 [R42][R45]
+  const u2 = await db.user.findUnique({ where: { id: userId }, select: { points: true } })
+  await db.pointLog.create({
+    data: { userId, type, delta: -amount, balanceAfter: u2!.points, refId: options.refId },
+  })
+}
+
+/**
+ * 转入积分（打赏/悬赏奖励/退款）。
+ * [R50] 只加余额、不计入累计、不升级 —— 与 earnPoints 的根本区别：
+ * 打赏收入搬的是「余额」这个口袋，等级仍需靠收入侧行为自己挣。
+ */
+export async function creditPoints(
+  userId: number,
+  type: CreditPointType,
+  delta: number,
+  options: SpendPointsOptions = {},
+  tx?: Prisma.TransactionClient,
+): Promise<void> {
+  const db = tx ?? prisma
+  // 转入必须是正整数（防负/小数转入：负 delta 会像 earnPoints 一样被当成「扣款通道」，语义错乱）
+  if (!Number.isInteger(delta) || delta <= 0) {
+    throw new ValidationError('转入金额必须是正整数')
+  }
+  const updated = await db.user.update({
+    where: { id: userId },
+    data: { points: { increment: delta } },
+    select: { points: true },
+  })
+  await db.pointLog.create({
+    data: { userId, type, delta, balanceAfter: updated.points, refId: options.refId },
+  })
+}
+
+/**
+ * 事务内读用户当前余额的辅助（消费/转入后返回给前端的最新余额）。
+ * 第一个参数传 tx（交易内）或全局 prisma，调用方按需给。
+ */
+export async function getBalance(
+  db: Prisma.TransactionClient | typeof prisma,
+  userId: number,
+): Promise<number> {
+  const u = await db.user.findUnique({ where: { id: userId }, select: { points: true } })
+  return u?.points ?? 0
 }
