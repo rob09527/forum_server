@@ -46,6 +46,12 @@ export const RedisKey = {
   /** 用户未读通知数（Redis 计数器，避免每事件 COUNT；已读时 DEL 兜底对账） */
   unreadCount: (userId: number) => `user:${userId}:unread_count` as const,
 
+  // ── 私信 ──
+  /** 用户未读私信总数（顶栏红点，Redis 计数器；已读时 DECR 兜底对账） */
+  dmUnread: (userId: number) => `dm:${userId}:unread` as const,
+  /** 私信发送限流计数，key 中 minute 格式为 YYYYMMDDHHMM */
+  dmRate: (userId: number, minute: string) => `dm_rate:${userId}:${minute}` as const,
+
   // ── 积分 ──
   /** 用户当日某类积分发放累计计数，key 中 type 为 post|comment，date 为 YYYY-MM-DD [R1/R2] */
   pointDaily: (type: string, userId: number, date: string) => `point_daily:${type}:${userId}:${date}` as const,

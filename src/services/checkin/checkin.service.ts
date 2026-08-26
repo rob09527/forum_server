@@ -20,7 +20,8 @@ import type { CheckinConfig } from '../config/config.service.js'
  *
  * 数据存储：
  * - 连续天数 / 累计天数 / 上次签到时间 落 DB（Redis 重启不丢，[R13] 判定依据）
- * - 当日签到用户集合 Redis SET（`checkin:YYYY-MM-DD:users`），供日历查询
+ * - 签到/补签均写 PointLog 台账，日历据此推导（权威，Redis 重启不丢）；
+ *   当日签到用户集合 Redis SET（`checkin:YYYY-MM-DD:users`）仅作软状态暖写
  */
 
 /** 签到状态（GET /api/checkin/status） */
@@ -117,8 +118,8 @@ export async function checkin(userId: number): Promise<CheckinResult> {
 
 /**
  * 查询签到状态。
- * month 格式 YYYY-MM，缺省为当前月。calendar 逐日查 Redis SET，
- * 31 次往返在 MVP 规模可接受（后续可换 Bitmap + BITCOUNT）。
+ * month 格式 YYYY-MM，缺省为当前月。calendar 以 point_logs 台账推导
+ * （签到日 + 补签日），不依赖 Redis —— Redis 重启不丢日历，与补签校验恒一致。
  */
 export async function checkinStatus(userId: number, month?: string): Promise<CheckinStatus> {
   const user = await prisma.user.findUnique({
@@ -154,22 +155,34 @@ export async function checkinStatus(userId: number, month?: string): Promise<Che
   const year = parts[0]
   const mon = parts[1]
 
-  // [日历] 本月每天查一次集合，存在即已签
-  const daysInMonth = new Date(year, mon, 0).getDate() // mon 为 1 基，new Date(y, m, 0) = 当月最后一天
-  const dayChecks = await Promise.all(
-    Array.from({ length: daysInMonth }, (_, i) => i + 1).map(async (d) => {
-      const dateStr = `${year}-${String(mon).padStart(2, '0')}-${String(d).padStart(2, '0')}`
-      const checked = await redis.sismember(RedisKey.checkinDate(dateStr), String(userId))
-      return checked ? dateStr : null
-    }),
-  )
-  const calendar = dayChecks.filter((d): d is string => d !== null)
+  // [日历] 以 point_logs 台账为准（type=checkin → 签到当日；type=makeup → 补签日 = 创建日 - 1 天）。
+  // 早期实现逐日查 Redis SET（checkin:YYYY-MM-DD:users），但该 key 无持久化保证，
+  // Redis 重启/清库即丢（docs/积分签到等级体系.md 2.4）——日历与补签校验（读 DB lastCheckinAt）
+  // 会不一致，出现「日历提示可补签、后端提示昨天已签到」。台账永久，二者恒一致。
+  // 查询范围含下月 1 号整天：1 号补签上月末（[R54] 只补昨天）时，补签日落在本月，需在本月视图可见。
+  const monthPrefix = `${year}-${String(mon).padStart(2, '0')}`
+  const logs = await prisma.pointLog.findMany({
+    where: {
+      userId,
+      type: { in: [PointType.CHECKIN, PointType.MAKEUP] },
+      createdAt: { gte: new Date(year, mon - 1, 1), lt: new Date(year, mon, 2) },
+    },
+    select: { type: true, createdAt: true },
+  })
+  const calendar = new Set<string>()
+  for (const log of logs) {
+    // 补签日 = 创建日 - 1 天（makeup 语义只补昨天）；签到日 = 创建日
+    const day = new Date(log.createdAt.getTime() - (log.type === PointType.MAKEUP ? 86400_000 : 0))
+    const dateStr = formatDateKey(day)
+    if (dateStr.startsWith(monthPrefix)) calendar.add(dateStr) // 跨月补签自动过滤
+  }
+  const calendarList = [...calendar].sort()
 
   return {
     streak: user.checkinStreak,
     totalDays: user.checkinTotalDays,
     checkedToday,
     todayDelta,
-    calendar,
+    calendar: calendarList,
   }
 }

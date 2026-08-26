@@ -8,14 +8,11 @@ import {
   markRead,
   markAllRead,
 } from '../services/notification/notification.service.js'
-import {
-  registerUserConnection,
-  unregisterUserConnection,
-} from '../services/notification/sse.js'
 
 /**
  * 站内通知路由。
  * 路由只做三件事：校验参数 → 调用 service → 返回响应。
+ * 实时推送（SSE）已统一收敛到 realtime.routes.ts 的 /api/me/stream。
  */
 
 /** 通知查询参数（分页） */
@@ -55,39 +52,5 @@ export async function notificationRoutes(fastify: FastifyInstance): Promise<void
   fastify.post('/api/me/notifications/read-all', { preHandler: [authenticate] }, async (request, reply) => {
     const result = await markAllRead(request.user!.id)
     sendSuccess(reply, result)
-  })
-
-  /**
-   * 通知实时推送（SSE，需登录）。
-   * EventSource 同源自动携带 cookie，authenticate 可复用鉴权。
-   * 连接保持期间每 30s 发一次心跳注释，避免代理/浏览器判定超时断开。
-   */
-  fastify.get('/api/me/notifications/stream', { preHandler: [authenticate] }, async (request, reply) => {
-    const userId = request.user!.id
-
-    reply.raw.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      Connection: 'keep-alive',
-      'X-Accel-Buffering': 'no', // 禁用 nginx 缓冲，SSE 实时性需要
-    })
-
-    // 初始注释行：EventSource 需收到首帧才触发 open 事件
-    reply.raw.write(': connected\n\n')
-
-    registerUserConnection(userId, reply)
-
-    // 心跳：每 30s 写注释行保活（SSE 注释行客户端会自动忽略）
-    const heartbeat = setInterval(() => {
-      if (!reply.raw.writableEnded) {
-        reply.raw.write(': ping\n\n')
-      }
-    }, 30000)
-
-    // 连接关闭时清理注册 + 心跳，避免连接/定时器泄漏
-    request.raw.on('close', () => {
-      clearInterval(heartbeat)
-      unregisterUserConnection(userId, reply)
-    })
   })
 }

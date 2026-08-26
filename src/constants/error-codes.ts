@@ -127,6 +127,18 @@ export const ErrorCode = {
   /** 通知不存在 */
   NOTIFICATION_NOT_FOUND: 'NOTIFICATION_NOT_FOUND',
 
+  // ── 私信 ──
+  /** 不能给自己发私信 */
+  DM_SELF: 'DM_SELF',
+  /** 不符合对方私信门槛（对方关闭私信 / 仅关注的人可私信） */
+  DM_FORBIDDEN: 'DM_FORBIDDEN',
+  /** 会话不存在 */
+  CONVERSATION_NOT_FOUND: 'CONVERSATION_NOT_FOUND',
+  /** 私信内容为空或超长 */
+  DM_CONTENT_INVALID: 'DM_CONTENT_INVALID',
+  /** 私信发送过于频繁 */
+  DM_RATE_LIMITED: 'DM_RATE_LIMITED',
+
   // ── 上传 ──
   /** 没有收到文件 */
   UPLOAD_NO_FILE: 'UPLOAD_NO_FILE',

@@ -5,7 +5,7 @@ import { levelProgress } from '../points/points.service.js'
 import type { LevelProgress } from '../points/points.service.js'
 import { getLevels } from '../config/config.service.js'
 import { isAvatarFree } from '../shop/shop.service.js'
-import { ALLOWED_AVATAR_STYLES, AVATARS_PER_STYLE, UserStatus } from '../../constants/business.js'
+import { ALLOWED_AVATAR_STYLES, AVATARS_PER_STYLE, ShopItemType, UserStatus } from '../../constants/business.js'
 import { effectiveAvatar } from '../../utils/avatar.js'
 import type { UserStatusType } from '../../constants/business.js'
 import type { UserPublic } from '../auth/auth.service.js'
@@ -338,18 +338,36 @@ export async function updateAvatar(userId: number, avatar: string): Promise<User
     throw new NotFoundError('用户', ErrorCode.NOT_FOUND)
   }
 
-  // 头像商品化：仅免费头像可自选；付费头像需在商城购买解锁（buyDecoration 写入租用覆盖层）。
+  // 头像商品化：免费头像可自选（写入基础头像）；付费头像需持有且未过期才能选用
+  // （购买/续费/商城切换走 decorAvatar 租用覆盖层，本接口同语义）。
   // 播种前（无商品行）视为免费，向后兼容。
-  if (!(await isAvatarFree(avatar))) {
-    throw new ForbiddenError('该头像需在商城购买解锁', ErrorCode.AVATAR_LOCKED)
+  let data: { avatar: string; decorAvatarValue: null; decorAvatarExpireAt: null } | { decorAvatarValue: string; decorAvatarExpireAt: Date }
+  if (await isAvatarFree(avatar)) {
+    // 选免费头像即清除租用覆盖层（UserDecoration 持有记录保留，仅不再佩戴）
+    data = { avatar, decorAvatarValue: null, decorAvatarExpireAt: null }
+  } else {
+    // 付费头像：校验本人持有且未过期（type=avatar 且 renderValue 匹配的有效装饰）
+    const owned = await prisma.userDecoration.findFirst({
+      where: { userId, type: ShopItemType.AVATAR, renderValue: avatar, expireAt: { gt: new Date() } },
+      select: { expireAt: true },
+    })
+    if (!owned) {
+      throw new ForbiddenError('该头像需在商城购买解锁', ErrorCode.AVATAR_LOCKED)
+    }
+    // 走租用覆盖层佩戴（与商城「切换」同语义），基础头像保留，到期自动回退
+    data = { decorAvatarValue: avatar, decorAvatarExpireAt: owned.expireAt }
   }
 
-  // 选免费头像即清除租用覆盖层（UserDecoration 持有记录保留，仅不再佩戴）
   const updated = await prisma.user.update({
     where: { id: userId },
-    data: { avatar, decorAvatarValue: null, decorAvatarExpireAt: null },
+    data,
     select: USER_PUBLIC_SELECT,
   })
 
-  return { ...updated, status: updated.status as UserStatusType }
+  // 返回折叠后的生效头像（租用未过期则覆盖基础），前端 updateUser 回写即可 [avatar 商品化]
+  return {
+    ...updated,
+    avatar: effectiveAvatar(updated.avatar, updated.decorAvatarValue, updated.decorAvatarExpireAt),
+    status: updated.status as UserStatusType,
+  }
 }

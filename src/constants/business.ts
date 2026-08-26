@@ -163,6 +163,17 @@ export const UserStatus = {
 } as const
 export type UserStatusType = (typeof UserStatus)[keyof typeof UserStatus]
 
+/** 私信隐私开关（用户自选：谁能给我发私信） */
+export const DmPrivacy = {
+  /** 所有人可私信 */
+  EVERYONE: 'everyone',
+  /** 仅关注我的人可私信 */
+  FOLLOWERS: 'followers',
+  /** 关闭私信 */
+  NOBODY: 'nobody',
+} as const
+export type DmPrivacyType = (typeof DmPrivacy)[keyof typeof DmPrivacy]
+
 /** 允许的头像风格（本地预置头像目录，对应前端 public/avatars/ 子目录）。
  * 已弃用风格（croodles-neutral 涂鸦2 / notionists-neutral 印象2）头像文件已删除，不再允许。 */
 export const ALLOWED_AVATAR_STYLES = [

@@ -24,6 +24,8 @@ import { adminRoutes } from './routes/admin.routes.js'
 import { searchRoutes } from './routes/search.routes.js'
 import { configRoutes } from './routes/config.routes.js'
 import { notificationRoutes } from './routes/notification.routes.js'
+import { realtimeRoutes } from './routes/realtime.routes.js'
+import { messageRoutes } from './routes/message.routes.js'
 import { bookmarkRoutes } from './routes/bookmark.routes.js'
 import { followRoutes } from './routes/follow.routes.js'
 import { shopRoutes } from './routes/shop.routes.js'
@@ -144,6 +146,8 @@ await fastify.register(adminRoutes)
 await fastify.register(searchRoutes)
 await fastify.register(configRoutes)
 await fastify.register(notificationRoutes)
+await fastify.register(realtimeRoutes)
+await fastify.register(messageRoutes)
 await fastify.register(bookmarkRoutes)
 await fastify.register(followRoutes)
 await fastify.register(shopRoutes)

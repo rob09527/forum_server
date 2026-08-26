@@ -100,6 +100,9 @@ model User {
   /// 实际配额 = config.UPLOAD_MAX_USER_TOTAL_SIZE + 本列，见 upload.service 校验 [1.4.2]
   uploadQuotaBonus    Int       @default(0)
 
+  /// 私信隐私开关：everyone(所有人可私信) | followers(仅关注我的人) | nobody(关闭私信)
+  dmPrivacy      String    @default("everyone")
+
   /// 积分流水记录
   pointLogs     PointLog[]
 
@@ -755,4 +758,79 @@ model Bounty {
   /// 发起门槛校验：单用户同时进行中的悬赏数上限 [1.8]
   @@index([userId, status])
   @@map("bounties")
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// 私信（Direct Message，1v1 会话化设计，预留群聊扩展）
+// ══════════════════════════════════════════════════════════════════════
+
+/// 私信会话（1v1；userAId/userBId 规范排序 userAId < userBId，保证 (userAId,userBId) 唯一查找）
+model Conversation {
+  /// 会话 ID，自增主键
+  id                 Int       @id @default(autoincrement())
+
+  /// 参与方 A（规范排序中较小的用户 ID）
+  userAId            Int
+
+  /// 参与方 B（规范排序中较大的用户 ID）
+  userBId            Int
+
+  /// 最后一条消息 ID（列表定位 / 游标）
+  lastMessageId      Int?
+
+  /// 最后一条消息预览（截断，会话列表展示用）
+  lastMessagePreview String?
+
+  /// 最后一条消息时间（会话列表排序）
+  lastMessageAt      DateTime?
+
+  /// userA 侧未读数（冗余，发送时 +1、已读时清零）
+  unreadCountA       Int       @default(0)
+
+  /// userB 侧未读数（冗余）
+  unreadCountB       Int       @default(0)
+
+  /// 创建时间
+  createdAt          DateTime  @default(now())
+
+  /// 最后更新时间
+  updatedAt          DateTime  @updatedAt
+
+  /// 会话下的消息
+  messages           Message[]
+
+  /// 参与方对唯一（规范排序后）
+  @@unique([userAId, userBId])
+  @@index([userAId, lastMessageAt(sort: Desc)])
+  @@index([userBId, lastMessageAt(sort: Desc)])
+  @@map("conversations")
+}
+
+/// 私信消息
+model Message {
+  /// 消息 ID，自增主键
+  id             Int          @id @default(autoincrement())
+
+  /// 所属会话 ID，会话删除时级联删除消息
+  conversationId Int
+
+  /// 所属会话
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  /// 发送者 ID
+  senderId       Int
+
+  /// 消息正文（纯文本，v1）
+  content        String       @db.Text
+
+  /// 发送时间
+  createdAt      DateTime     @default(now())
+
+  /// 已读时间（已读回执，phase 2 用；null 表示未读）
+  readAt         DateTime?
+
+  /// 会话内按时间升序拉取 + 游标分页
+  @@index([conversationId, createdAt])
+  @@index([conversationId, id])
+  @@map("messages")
 }

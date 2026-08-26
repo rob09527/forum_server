@@ -76,10 +76,10 @@ export async function postRoutes(fastify: FastifyInstance): Promise<void> {
     sendSuccess(reply, hotPosts)
   })
 
-  /** GET /api/posts/:id — 帖子详情（需登录，登录用户计入浏览量去重） */
-  fastify.get('/api/posts/:id', { preHandler: [authenticate] }, async (request, reply) => {
+  /** GET /api/posts/:id — 帖子详情（游客可读；登录用户计入浏览量去重并注入收藏态） */
+  fastify.get('/api/posts/:id', { preHandler: [optionalAuth] }, async (request, reply) => {
     const { id } = request.params as { id: string }
-    const post = await getPostById(parseId(id), request.user!.id)
+    const post = await getPostById(parseId(id), request.user?.id)
     sendSuccess(reply, post)
   })
 

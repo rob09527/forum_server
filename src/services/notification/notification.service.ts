@@ -10,7 +10,7 @@ import {
 import type { SystemNotifyTargetType, NotificationTypeType } from '../../constants/business.js'
 import { redis, RedisKey } from '../../lib/redis.js'
 import { effectiveAvatar } from '../../utils/avatar.js'
-import { pushToUser, pushToAllOnline } from './sse.js'
+import { pushToUser, pushToAllOnline } from '../realtime/sse.js'
 import { extractMentionedUserIds } from '../../utils/mention.js'
 
 /**
@@ -181,7 +181,7 @@ export function createAndPush(input: CreateNotificationInput): void {
     try {
       const created = await createNotification(input)
       const unread = await refreshUnread(input.userId, created.created)
-      pushToUser(input.userId, {
+      pushToUser(input.userId, 'notification', {
         notification: created,
         unreadCount: unread,
       })
@@ -442,7 +442,7 @@ export async function broadcastSystemNotification(
     }
     // 只对在线接收者推 SSE（pushToUser 对离线用户是 O(1) Map 空查）
     for (const userId of userIds) {
-      pushToUser(userId, { type: 'system' })
+      pushToUser(userId, 'notification', { type: 'system' })
     }
     return { sentCount: userIds.length }
   }
@@ -486,7 +486,7 @@ export async function broadcastSystemNotification(
   }
 
   // 只推在线连接（在线 ⊂ 全部 active 接收者），不再遍历全部接收者
-  pushToAllOnline({ type: 'system' })
+  pushToAllOnline('notification', { type: 'system' })
 
   return { sentCount: written }
 }
