@@ -15,7 +15,7 @@ export async function authRoutes(fastify: FastifyInstance): Promise<void> {
    * 邮箱注册，返回用户信息和 session token
    */
   fastify.post('/api/auth/register', {
-    config: { rateLimit: { max: 5, timeWindow: '1 minute' } },
+    config: { rateLimit: { max: 100000, timeWindow: '1 minute' } }, // TODO-ROLLBACK: 造数临时放大,完成后改回 max:5
     schema: {
       body: {
         type: 'object',
@@ -51,7 +51,7 @@ export async function authRoutes(fastify: FastifyInstance): Promise<void> {
    * 邮箱登录
    */
   fastify.post('/api/auth/login', {
-    config: { rateLimit: { max: 5, timeWindow: '1 minute' } },
+    config: { rateLimit: { max: 100000, timeWindow: '1 minute' } }, // TODO-ROLLBACK: 造数临时放大,完成后改回 max:5
     schema: {
       body: {
         type: 'object',
@@ -85,7 +85,7 @@ export async function authRoutes(fastify: FastifyInstance): Promise<void> {
    * TG 登录/注册（合一），验签后自动处理
    */
   fastify.post('/api/auth/telegram', {
-    config: { rateLimit: { max: 5, timeWindow: '1 minute' } },
+    config: { rateLimit: { max: 100000, timeWindow: '1 minute' } }, // TODO-ROLLBACK: 造数临时放大,完成后改回 max:5
     schema: {
       body: {
         type: 'object',
