@@ -171,8 +171,13 @@ export async function checkinStatus(userId: number, month?: string): Promise<Che
   })
   const calendar = new Set<string>()
   for (const log of logs) {
-    // 补签日 = 创建日 - 1 天（makeup 语义只补昨天）；签到日 = 创建日
-    const day = new Date(log.createdAt.getTime() - (log.type === PointType.MAKEUP ? 86400_000 : 0))
+    // 补签日 = 创建日的前一自然日（makeup 语义只补昨天）；签到日 = 创建日。
+    // 用日历运算 setDate 而非固定 -86400_000：跨夏令时/跨日时「24 小时前」≠「上一自然日」，
+    // 固定减法会把补签日算到错误的日期（如 25 小时的一天取到前天）。
+    const day = new Date(log.createdAt)
+    if (log.type === PointType.MAKEUP) {
+      day.setDate(day.getDate() - 1)
+    }
     const dateStr = formatDateKey(day)
     if (dateStr.startsWith(monthPrefix)) calendar.add(dateStr) // 跨月补签自动过滤
   }

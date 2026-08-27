@@ -9,8 +9,9 @@ import { adminRefundBounty } from '../services/bounty/bounty.service.js'
 import { sweepExpiredBounties } from '../services/bounty/bounty-sweep.js'
 import { deletePostById } from '../services/post/post.service.js'
 import { broadcastSystemNotification } from '../services/notification/notification.service.js'
-import { getAllConfigs, setConfig, resetConfig } from '../services/config/config.service.js'
+import { getAllConfigs, setConfig, resetConfig, getLevels } from '../services/config/config.service.js'
 import type { ConfigGroup } from '../services/config/config.service.js'
+import { recomputeLevels } from '../services/points/points.service.js'
 import { requireAdminKey } from '../middleware/admin-key.middleware.js'
 import { UserRole, UserStatus, SystemNotifyTarget } from '../constants/business.js'
 import type { SystemNotifyTargetType } from '../constants/business.js'
@@ -262,6 +263,8 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
     async (request, reply) => {
       const { group } = request.params as { group: ConfigGroup }
       await setConfig(group, request.body)
+      // 等级配置保存后重算存量用户 level（删档/改门槛后 level 不滞后）
+      if (group === 'levels') await recomputeLevels(await getLevels())
       sendSuccess(reply, { group })
     },
   )

@@ -7,7 +7,7 @@ import { ValidationError } from '../../utils/errors.js'
 /**
  * 游戏化配置服务（签到奖励 / 等级体系）。
  *
- * 配置来源：admin 后端直写共享 Redis（key: config:checkin / config:levels，见 constants/redis-keys.ts）。
+ * 配置来源：admin 经 HTTP 转发写入（key: config:checkin / config:levels，见 constants/redis-keys.ts；写入口见文件底部 setConfig）。
  * forum 侧只读 + 校验 + 兜底：
  * - Redis 无此 key / 值为非法 JSON / 不满足 schema → 返回下方 DEFAULT_* 默认值
  * - Redis 连接异常 → 同样兜底，绝不让配置读取拖垮签到/发帖等核心路径
@@ -49,12 +49,27 @@ export const DEFAULT_CHECKIN_CONFIG: CheckinConfig = {
   milestoneBonus: 30,
 }
 
-/** 默认等级：鸡爪≥0 / 鸡腿≥100 / 鸡肉≥500（按 minTotal 降序，与配置存储同序） */
-export const DEFAULT_LEVELS: LevelConfig[] = [
+/**
+ * 等级预置池：固定 10 档，key 预生成、不可改（存 users.level），名字/门槛为占位默认值，admin 可改。
+ * 按 minTotal 降序存储（最高档在前、基础档 claw 在最后），与配置存储同序。
+ * 后台只能在这 10 档内「增减激活数量」（每次 +1/−1 档、不可跳档）：激活的等级 = 本池末尾 N 项。
+ * 最底 3 档沿用现有 meat/leg/claw，保证存量 users.level 数据向后兼容。
+ */
+export const LEVEL_POOL: LevelConfig[] = [
+  { key: 'mythic', name: '神兽', minTotal: 64000 },
+  { key: 'divine', name: '神鸟', minTotal: 32000 },
+  { key: 'phoenix', name: '凤凰', minTotal: 16000 },
+  { key: 'pheasant', name: '山鸡', minTotal: 8000 },
+  { key: 'free', name: '走地鸡', minTotal: 4000 },
+  { key: 'whole', name: '整鸡', minTotal: 2000 },
+  { key: 'wing', name: '鸡翅', minTotal: 1000 },
   { key: UserLevel.MEAT, name: '鸡肉', minTotal: 500 },
   { key: UserLevel.LEG, name: '鸡腿', minTotal: 100 },
   { key: UserLevel.CLAW, name: '鸡爪', minTotal: 0 },
 ]
+
+/** 默认激活等级：池末尾 3 档（鸡爪≥0 / 鸡腿≥100 / 鸡肉≥500），Redis 空/非法时回退 */
+export const DEFAULT_LEVELS: LevelConfig[] = LEVEL_POOL.slice(-3)
 
 /** 签到配置 schema：全部为非负整数，milestoneEvery 至少为 1 */
 const checkinConfigSchema = z.object({
@@ -72,16 +87,30 @@ const levelConfigSchema = z.object({
 })
 
 /**
- * 等级列表 schema：非空、key 唯一、恰好一个 minTotal=0 的起始等级、按 minTotal 严格降序。
- * 任一不满足即整体兜底，避免 admin 配出「无基础等级」或「门槛乱序」导致等级判定错乱。
+ * 等级列表 schema：非空（1~10 档）、key 必须为预置池末尾 N 项（key 不可变/不可新增/不可跳档）、
+ * 恰好一个 minTotal=0 的起始等级、按 minTotal 严格降序。
+ * 任一不满足即整体兜底，避免 admin 配出「无基础等级」「门槛乱序」或「自定义 key」导致等级判定错乱。
  */
 const levelsSchema = z
   .array(levelConfigSchema)
   .min(1, '等级列表不能为空')
+  .max(10, '等级最多 10 档')
   .superRefine((levels, ctx) => {
     const keys = levels.map((l) => l.key)
     if (new Set(keys).size !== keys.length) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, message: '等级 key 必须唯一' })
+    }
+    // key 必须 = 预置池末尾 N 项（N = 当前激活档数），顺序一致。
+    // 一条约束同时封死「key 改名 / 重排 / 跳档 / 中途删档」：key 只能从池末尾连续取。
+    const expectedKeys = LEVEL_POOL.slice(LEVEL_POOL.length - levels.length).map((l) => l.key)
+    for (let i = 0; i < levels.length; i++) {
+      if (levels[i].key !== expectedKeys[i]) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `等级 key 必须为预置池中连续的最低 ${levels.length} 档（${expectedKeys.join(' / ')}），key 不可新增/改名/跳档`,
+        })
+        break
+      }
     }
     if (levels.filter((l) => l.minTotal === 0).length !== 1) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, message: '必须恰好一个 minTotal=0 的起始等级' })
@@ -308,7 +337,7 @@ const CONFIG_GROUPS = {
   props: { key: RedisKey.configProps, schema: propsConfigSchema, get: getPropsConfig },
 } as const satisfies Record<ConfigGroup, { key: string; schema: z.ZodTypeAny; get: () => Promise<unknown> }>
 
-/** 6 组配置的已解析生效值（zod 校验 + 默认兜底后的真实值，admin 表单据此初始化） */
+/** 6 组配置的已解析生效值 + 等级预置池（zod 校验 + 默认兜底后的真实值，admin 表单据此初始化） */
 export async function getAllConfigs() {
   const [checkin, levels, shop, tip, bounty, props] = await Promise.all([
     getCheckinConfig(),
@@ -318,7 +347,7 @@ export async function getAllConfigs() {
     getBountyConfig(),
     getPropsConfig(),
   ])
-  return { checkin, levels, shop, tip, bounty, props }
+  return { checkin, levels, shop, tip, bounty, props, levelPool: LEVEL_POOL }
 }
 
 /** 写入一组配置：先 zod 校验再落 Redis，非法值直接抛 400，不写脏数据 */

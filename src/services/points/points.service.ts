@@ -2,7 +2,7 @@ import type { Prisma } from '@prisma/client'
 import { prisma } from '../../lib/prisma.js'
 import { redis } from '../../lib/redis.js'
 import { RedisKey } from '../../constants/redis-keys.js'
-import { PointType, UserLevel } from '../../constants/business.js'
+import { PointType } from '../../constants/business.js'
 import type { IncomePointType, SpendPointType, CreditPointType } from '../../constants/business.js'
 import { ErrorCode } from '../../constants/error-codes.js'
 import { ValidationError, InsufficientPointsError } from '../../utils/errors.js'
@@ -131,7 +131,7 @@ export function levelForTotal(total: number, levels: LevelConfig[]): string {
   for (const t of levels) {
     if (total >= t.minTotal) return t.key
   }
-  return levels[levels.length - 1]?.key ?? UserLevel.CLAW
+  return levels[levels.length - 1]?.key ?? ''
 }
 
 /** 等级进度（用户资料页进度条用）：当前等级 + 下一门槛 + 还差多少 */
@@ -147,7 +147,7 @@ export interface LevelProgress {
 /** 按累计鸡腿算等级进度 [R21]，门槛规则来自后台配置（config.service.getLevels） */
 export function levelProgress(total: number, levels: LevelConfig[]): LevelProgress {
   const ascending = [...levels].reverse() // 最低 → 最高（claw → leg → meat）
-  let level = ascending[0]?.key ?? UserLevel.CLAW
+  let level = ascending[0]?.key ?? ''
   let nextLevelAt: number | null = null
   for (const t of ascending) {
     if (total >= t.minTotal) {
@@ -161,6 +161,29 @@ export function levelProgress(total: number, levels: LevelConfig[]): LevelProgre
     level,
     nextLevelAt,
     remaining: nextLevelAt === null ? 0 : nextLevelAt - total,
+  }
+}
+
+/**
+ * 保存等级配置后重算存量用户的 level（仅回写实际变化的行）。
+ * 「删减档」的必需步骤：删掉最高档后，原该档用户按 totalPointsEarned 回落到新最高档。
+ * 幂等、可重跑：按新等级分组，每组一条 updateMany；部分失败下次保存等级时自动补齐，故不额外包事务。
+ */
+export async function recomputeLevels(levels: LevelConfig[]): Promise<void> {
+  const users = await prisma.user.findMany({
+    select: { id: true, totalPointsEarned: true, level: true },
+  })
+  const byLevel = new Map<string, number[]>()
+  for (const u of users) {
+    const next = levelForTotal(u.totalPointsEarned, levels)
+    if (next !== u.level) {
+      const list = byLevel.get(next)
+      if (list) list.push(u.id)
+      else byLevel.set(next, [u.id])
+    }
+  }
+  for (const [level, ids] of byLevel) {
+    await prisma.user.updateMany({ where: { id: { in: ids } }, data: { level } })
   }
 }
 
