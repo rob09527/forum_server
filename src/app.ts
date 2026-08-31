@@ -108,7 +108,7 @@ await fastify.register(cookie)
 // errorResponseBuilder 统一错误格式，避免破坏前端 extractErrorMessage 的解析。
 await fastify.register(rateLimit, {
   global: true,
-  max: 100000, // TODO-ROLLBACK: 测试服造数临时放大限流,完成后改回 600
+  max: 600,
   timeWindow: '1 minute',
   // errorResponseBuilder 必须「throw」一个带 statusCode + code 的错误对象，
   // 走全局 errorHandler 的 AppError 分支统一格式化（若返回 body 会被当 500 处理）。
