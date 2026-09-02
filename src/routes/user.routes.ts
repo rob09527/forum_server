@@ -1,8 +1,11 @@
 import type { FastifyInstance } from 'fastify'
 import { getUserProfile, getUserPointsLog, getLatestUsers, searchUsers, updateAvatar, checkUsernameAvailable } from '../services/user/user.service.js'
+import type { PointsLogFilter } from '../services/user/user.service.js'
 import { authenticate } from '../middleware/auth.middleware.js'
 import { parseId } from '../utils/parse.js'
 import { sendSuccess } from '../utils/response.js'
+import { ValidationError } from '../utils/errors.js'
+import { ErrorCode } from '../constants/error-codes.js'
 import { ALLOWED_AVATAR_STYLES, AVATARS_PER_STYLE } from '../constants/business.js'
 
 /**
@@ -23,18 +26,23 @@ export async function userRoutes(fastify: FastifyInstance): Promise<void> {
   })
 
   /**
-   * GET /api/user/:id/points-log?page=1&pageSize=20
+   * GET /api/user/:id/points-log?page=1&pageSize=20&type=income|expense
    * 积分流水（需登录，仅本人可见），按时间倒序分页。
+   * type 可选：income=仅收入 / expense=仅支出 / 不传=全部；返回附带全量收支合计。
    */
   fastify.get('/api/user/:id/points-log', { preHandler: [authenticate] }, async (request, reply) => {
     const { id } = request.params as { id: string }
     const userId = parseId(id)
 
-    const query = request.query as { page?: string; pageSize?: string }
+    const query = request.query as { page?: string; pageSize?: string; type?: string }
     const page = Number(query.page ?? 1)
     const pageSize = Number(query.pageSize ?? 20)
+    const type = query.type
+    if (type !== undefined && type !== 'income' && type !== 'expense') {
+      throw new ValidationError('type 必须是 income 或 expense', ErrorCode.VALIDATION_ERROR)
+    }
 
-    const log = await getUserPointsLog(userId, request.user!.id, page, pageSize)
+    const log = await getUserPointsLog(userId, request.user!.id, page, pageSize, type as PointsLogFilter)
     sendSuccess(reply, log)
   })
 

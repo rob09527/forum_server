@@ -64,9 +64,9 @@ export interface UserProfile {
 export interface PointLogItem {
   /** 流水 ID */
   id: number
-  /** 积分来源：checkin(签到) | post(发帖) | comment(评论) | liked(被点赞) */
+  /** 积分来源：checkin | post | comment | liked | shop | tip_out | bounty_out … */
   type: string
-  /** 变动值（正数，MVP 无扣分）[R41] */
+  /** 变动值（带符号：收入为正，消费/支出为负） */
   delta: number
   /** 变动后鸡腿余额 [R42] */
   balanceAfter: number
@@ -74,6 +74,16 @@ export interface PointLogItem {
   refId: number | null
   /** 变动时间，ISO 8601 */
   createdAt: string
+}
+
+/** 积分流水分页结果：在分页基础上附带资产总览（不随筛选/页码变化） */
+export interface PointsLogResult extends Paginated<PointLogItem> {
+  /** 累计获得（等级口径 totalPointsEarned，只增不减）：供「累计获得」展示，避免前端另发 profile 请求 */
+  totalEarned: number
+  /** 收入合计：全量正向流水之和（签到/发帖/评论/被赞/打赏入账/悬赏奖励/退款等） */
+  totalIncome: number
+  /** 支出合计：全量负向流水之和的绝对值（店铺消费/打赏支出/悬赏支出等），恒为非负 */
+  totalExpense: number
 }
 
 /** 分页结果 */
@@ -263,23 +273,27 @@ export async function getUserProfile(userId: number, viewerId?: number): Promise
   }
 }
 
+/** 积分流水收支类型筛选：income=仅正向，expense=仅负向，不传=全部 */
+export type PointsLogFilter = 'income' | 'expense'
+
 /** 分页查询用户积分流水，按时间倒序。仅本人可见（viewerId 非本人抛 403）。 */
 export async function getUserPointsLog(
   userId: number,
   viewerId: number,
   page = 1,
   pageSize = 20,
-): Promise<Paginated<PointLogItem>> {
+  filter?: PointsLogFilter,
+): Promise<PointsLogResult> {
   if (viewerId !== userId) {
     throw new ForbiddenError('积分流水仅本人可见')
   }
 
-  const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true } })
+  const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true, totalPointsEarned: true } })
   if (!user) {
     throw new NotFoundError('用户', ErrorCode.NOT_FOUND)
   }
 
-  // 页码/页大小校验：非法值抛校验错误（避免 skip: NaN 导致 500）
+  // 页码/页大小/筛选参数校验：非法值抛校验错误（避免 skip: NaN 导致 500）
   if (!Number.isInteger(page) || page < 1) {
     throw new ValidationError('页码必须是正整数', ErrorCode.VALIDATION_ERROR)
   }
@@ -287,15 +301,22 @@ export async function getUserPointsLog(
     throw new ValidationError('每页条数必须是正整数', ErrorCode.VALIDATION_ERROR)
   }
   const safePageSize = Math.min(50, pageSize)
+  // 列表的 delta 方向条件由筛选决定（income>0 / expense<0 / 全部）
+  const deltaCond = filter === 'income' ? { delta: { gt: 0 } } : filter === 'expense' ? { delta: { lt: 0 } } : {}
+  const where = { userId, ...deltaCond }
 
-  const [total, rows] = await Promise.all([
-    prisma.pointLog.count({ where: { userId } }),
+  // 收支合计：永远统计全部流水（不随 type 筛选/页码变化），供资产总览展示。
+  // 注意不能用「totalPointsEarned - balance」推导——creditPoints 通道(打赏入账/悬赏退款)只加余额不累计，会算出差值失真。
+  const [total, rows, incomeAgg, expenseAgg] = await Promise.all([
+    prisma.pointLog.count({ where }),
     prisma.pointLog.findMany({
-      where: { userId },
+      where,
       orderBy: { createdAt: 'desc' },
       skip: (page - 1) * safePageSize,
       take: safePageSize,
     }),
+    prisma.pointLog.aggregate({ where: { userId, delta: { gt: 0 } }, _sum: { delta: true } }),
+    prisma.pointLog.aggregate({ where: { userId, delta: { lt: 0 } }, _sum: { delta: true } }),
   ])
 
   return {
@@ -311,6 +332,9 @@ export async function getUserPointsLog(
     pageSize: safePageSize,
     total,
     totalPages: Math.ceil(total / safePageSize),
+    totalEarned: user.totalPointsEarned,
+    totalIncome: incomeAgg._sum.delta ?? 0,
+    totalExpense: Math.abs(expenseAgg._sum.delta ?? 0),
   }
 }
 

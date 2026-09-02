@@ -3,6 +3,7 @@ import { register, login, telegramAuth } from '../services/auth/auth.service.js'
 import { revokeToken, SESSION_COOKIE, SESSION_TTL } from '../services/auth/auth-token.service.js'
 import { authenticate } from '../middleware/auth.middleware.js'
 import { sendSuccess } from '../utils/response.js'
+import { config } from '../config.js'
 
 /**
  * 认证相关路由。
@@ -122,6 +123,18 @@ export async function authRoutes(fastify: FastifyInstance): Promise<void> {
     })
 
     sendSuccess(reply, result)
+  })
+
+  /**
+   * GET /api/auth/telegram/config
+   * 公开（无需登录）：返回 Telegram 登录所需的 bot 公开配置。
+   * botId 供前端拼接 oauth.telegram.org/auth/logout 实现"切换账号"（先登出旧授权再重新授权）。
+   * 仅暴露公开信息：bot 数字 id 是全局公开标识，不含 token secret。
+   */
+  fastify.get('/api/auth/telegram/config', async (_request, reply) => {
+    // token 形如 "123456789:AA..."，冒号前为 bot 数字 id；未配置则 botId 为 null
+    const match = /^(\d+):/.exec(config.TELEGRAM_BOT_TOKEN)
+    sendSuccess(reply, { botId: match ? Number(match[1]) : null })
   })
 
   /**
