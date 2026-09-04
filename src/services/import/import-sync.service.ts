@@ -143,7 +143,7 @@ export async function planCursor(
 /**
  * 推断当前阶段(仅冷启动兜底;一旦显式写入过 importPhase 就以显式值为准)。
  * 推断口径依赖数据现状:
- * - 无任何导入映射 → 回灌还没开始 → backfill
+ * - 无任何导入映射 → 空库:不回灌、不造数,直接 incremental(从当前最新开始同步,宁可漏不可重)
  * - 有内容但影子用户无积分 → 内容已回灌、还没造数 → fabricate
  * - 影子用户已有积分 → 造数已完成 → incremental
  */
@@ -153,7 +153,7 @@ async function detectPhase(): Promise<'backfill' | 'fabricate' | 'incremental'> 
     return explicit
   }
   const mappingCount = await prisma.importMapping.count()
-  if (mappingCount === 0) return 'backfill'
+  if (mappingCount === 0) return 'incremental'
   const shadowPointLogCount = await prisma.pointLog.count({ where: { user: { isShadow: true } } })
   return shadowPointLogCount > 0 ? 'incremental' : 'fabricate'
 }
@@ -236,7 +236,7 @@ async function consumePendingPosts(
 
   if (plan.mode === 'cold-start') {
     await advanceCursor(cursorKey, lockKey, owner, plan.initTo!)
-    console.log(`[import-sync] 冷启动:游标初始化为 ${plan.initTo}(不回灌历史,历史由 backfill 负责)`)
+    console.log(`[import-sync] 冷启动:游标初始化为 ${plan.initTo}(不回灌历史,历史需显式 phase=backfill 手动回灌)`)
     return
   }
   if (plan.pending.length === 0) return
