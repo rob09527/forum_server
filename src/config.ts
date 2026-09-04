@@ -48,13 +48,13 @@ const envSchema = z.object({
   POST_MIN_CONTENT_LENGTH: z.coerce.number().int().positive().default(10),
 
   /**
-   * NodeLoc 增量同步开关，默认关闭。
-   * 必须在「全量回填 + 阶段 2.5 造数」都完成后才置 true，
-   * 否则实时积分重放会与造数重复计账（见 docs/NodeLoc数据迁移手册.md）。
+   * NodeLoc 数据同步 worker 开关，默认关闭。
+   * true = 启用 worker：冷启动自动完成「全量回灌 → 造数 → 切增量」三阶段，
+   * 之后进入 /posts.json 增量轮询，无需任何手工回填/造数前置步骤。
    */
   IMPORT_SYNC_ENABLED: z
     .string()
-    .default('true')
+    .default('false')
     .transform((v) => v === 'true'),
 
   // ── 搜索（Meilisearch） ──

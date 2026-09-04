@@ -161,18 +161,31 @@ async function readGroup<T>(key: string, schema: z.ZodType<T>, fallback: T): Pro
 
   return setInFlightConfig(key, (async () => {
     let value = fallback
+    let raw: string | null
     try {
-      const raw = await redis.get(key)
-      if (raw) {
-        const parsed = schema.safeParse(JSON.parse(raw))
-        if (parsed.success) value = parsed.data
-        else {
-          const detail = parsed.error.issues.map((i) => `${i.path.join('.') || '值'} ${i.message}`).join('；')
-          console.error(`[config] ${key} 内容非法，已回退默认值（后台的修改不会生效）：${detail}`)
-        }
-      }
+      raw = await redis.get(key)
     } catch (err) {
+      // Redis 异常（基础设施故障）吞掉走默认值，不拖垮签到/发帖/限流等核心路径
       console.warn(`[config] 读取 ${key} 失败，使用默认值兜底:`, (err as Error).message)
+      setCachedConfig(key, value)
+      return value
+    }
+    if (raw) {
+      let json: unknown
+      try {
+        json = JSON.parse(raw)
+      } catch {
+        // JSON 解析失败 = 后台写进了脏数据（不是基础设施故障），必须 error 而非 warn
+        console.error(`[config] ${key} 不是合法 JSON，已回退默认值（后台的修改不会生效）`)
+        setCachedConfig(key, value)
+        return value
+      }
+      const parsed = schema.safeParse(json)
+      if (parsed.success) value = parsed.data
+      else {
+        const detail = parsed.error.issues.map((i) => `${i.path.join('.') || '值'} ${i.message}`).join('；')
+        console.error(`[config] ${key} 内容非法，已回退默认值（后台的修改不会生效）：${detail}`)
+      }
     }
     setCachedConfig(key, value)
     return value

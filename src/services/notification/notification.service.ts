@@ -296,10 +296,10 @@ export async function listNotifications(
     actorIds.length
       ? prisma.user.findMany({
           where: { id: { in: actorIds } },
-          select: { id: true, username: true, avatar: true, decorAvatarValue: true, decorAvatarExpireAt: true },
+          select: { id: true, username: true, avatar: true },
         })
       : Promise.resolve(
-          [] as { id: number; username: string; avatar: string | null; decorAvatarValue: string | null; decorAvatarExpireAt: Date | null }[],
+          [] as { id: number; username: string; avatar: string | null }[],
         ),
     postIds.length
       ? prisma.post.findMany({

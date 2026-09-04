@@ -120,33 +120,21 @@ export const RedisKey = {
   bountySweepLock: 'bounty:sweep:lock',
 
   // ── NodeLoc 数据导入 ──
-  /** 增量同步分布式锁（SET NX EX 110），保证多实例只有一个轮询 /posts.json */
+  /** 增量同步分布式锁（SET NX EX 180），保证多实例只有一个执行回灌/造数/增量 */
   importSyncLock: 'import:sync:lock',
   /** 增量同步游标：已处理的对方最大 post id（字符串数字） */
   importCursor: (source: string) => `import:${source}:cursor` as const,
   /**
-   * 增量同步的「候选池」（HASH）。field = 对方 topicId，
-   * value = `{"f":首见 epochMs,"n":下次评估 epochMs}` 的 JSON 串。
-   *
-   * 为什么需要池子：worker 在对方一楼发出后约 2 分钟就能看到主题，
-   * 那一刻 views/likes/posts_count 三项信号**全是 0**（实测 60 主题分桶，见交接快照 §2.5.8 ①-a），
-   * 「首见即判定质量门槛」会拒绝 100% 的主题。故首见只入池、不落库，
-   * 满 `SYNC_TOPIC_MATURITY_HOURS` 后再取一次详情评估；未达标顺延重评，
-   * 滞留超 `SYNC_CANDIDATE_TTL_HOURS` 才永久丢弃。
-   *
-   * ⚠️ key 本身**不设 TTL**：条目过期由业务逻辑 `HDEL` + 打日志完成，
-   * 靠 Redis 自动过期就看不见「丢了哪些主题」。池子有硬上界（约 250 条）。
+   * 同步阶段标记（STRING）：backfill | fabricate | incremental。
+   * 由 runImportSync 显式写入，让三阶段状态机跨进程重启可恢复；
+   * 不靠「读数据现状」每次重推断——否则回填到一半重启，会被误判成已完成而跳过剩余回填。
    */
-  importSyncCandidates: (source: string) => `import:${source}:candidates` as const,
+  importPhase: (source: string) => `import:${source}:phase` as const,
   /**
-   * 增量同步的每日新主题导入配额计数器（STRING，`INCR`）。
-   * date 为**本地日期** `YYYY-MM-DD`，与 `pointDaily` 同口径（用 `formatDateKey`）。
-   *
-   * 计数在 `importTopic` **成功之后**才自增：抛错的主题留在池里下轮重试，不白吃配额。
-   * TTL 48h，且**只在计数器首次创建（值为 1）时设**——
-   * 每次 `INCR` 都 `EXPIRE` 会把过期时间不断往后推，counter 永不消失。
+   * 回填页游标（STRING）：下一个要处理的 /latest.json?order=created 页码。
+   * 替代旧脚本的文件断点 .import-backfill-checkpoint.json，随 worker 一起存 Redis。
    */
-  importSyncQuota: (source: string, date: string) => `import:${source}:quota:${date}` as const,
+  importBackfillPage: (source: string) => `import:${source}:backfill-page` as const,
 
   // ── 装饰 ──
   /** 装饰到期提醒的分布式锁（SET NX EX 60）。保证多实例只有一个扫描今日到期 [T2] */

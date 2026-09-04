@@ -35,8 +35,6 @@ export const AUTHOR_SELECT = {
   username: true,
   avatar: true,
   level: true,
-  decorAvatarValue: true,
-  decorAvatarExpireAt: true,
   decorColorValue: true,
   decorColorExpireAt: true,
   decorTitleValue: true,
@@ -44,11 +42,8 @@ export const AUTHOR_SELECT = {
   decorTitleExpireAt: true,
 } as const
 
-/** AUTHOR_SELECT 的原始行（含租用头像覆盖层两列），供 toAuthorBrief 折叠 */
-export type AuthorRow = AuthorBrief & {
-  decorAvatarValue: string | null
-  decorAvatarExpireAt: Date | null
-}
+/** AUTHOR_SELECT 的原始行。头像商城下线后（§9.1）无租用覆盖层，等价于 AuthorBrief */
+export type AuthorRow = AuthorBrief
 
 /**
  * 原始 author 行 → AuthorBrief。

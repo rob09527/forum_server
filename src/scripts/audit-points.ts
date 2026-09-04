@@ -1,5 +1,5 @@
 import { prisma } from '../lib/prisma.js'
-import { PointType } from '../constants/business.js'
+import { INCOME_POINT_TYPES } from '../constants/business.js'
 
 /**
  * 积分账本对账脚本（docs/积分消费体系.md 审计 B2 / [R42]）。
@@ -13,15 +13,6 @@ import { PointType } from '../constants/business.js'
  * 只读不写，安全可随时执行。退出码：0 = 全部对平，1 = 存在差异。
  */
 
-/** 收入侧积分类型（earnPoints 同时增累计；spend/credit 不触碰累计 [R44][R50]） */
-const INCOME_TYPES = new Set<string>([
-  PointType.CHECKIN,
-  PointType.POST,
-  PointType.COMMENT,
-  PointType.LIKED,
-  PointType.TRANSFER,
-])
-
 const run = async () => {
   let issues = 0
 
@@ -34,7 +25,7 @@ const run = async () => {
 
   const incomeByUser = await prisma.pointLog.groupBy({
     by: ['userId'],
-    where: { type: { in: [...INCOME_TYPES] } },
+    where: { type: { in: [...INCOME_POINT_TYPES] } },
     _sum: { delta: true },
   })
   const earnedSum = new Map(incomeByUser.map((r) => [r.userId, r._sum.delta ?? 0]))

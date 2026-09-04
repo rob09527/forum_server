@@ -126,6 +126,20 @@ export type IncomePointType =
   | typeof PointType.LIKED
   | typeof PointType.TRANSFER
 
+/**
+ * 收入侧积分类型集合（走 earnPoints，同增余额与累计）。
+ * 审计 / 造数脚本共用此口径，禁止再各自手抄一份 Set（[R44][R50]）。
+ * 类型放宽为 string 而非 IncomePointType：消费方（审计 where in / 造数 has()）拿到的都是
+ * PointLog.type 的 String 列，用窄类型反而要在调用处 cast。
+ */
+export const INCOME_POINT_TYPES: ReadonlySet<string> = new Set<string>([
+  PointType.CHECKIN,
+  PointType.POST,
+  PointType.COMMENT,
+  PointType.LIKED,
+  PointType.TRANSFER,
+])
+
 /** 消费侧积分类型：走 spendPoints，只扣余额、永不触碰累计 [R44] */
 export type SpendPointType =
   | typeof PointType.SHOP

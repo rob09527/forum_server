@@ -13,9 +13,7 @@
     "db:studio": "prisma studio",
     "db:generate": "prisma generate",
     "search:reindex": "tsx src/scripts/reindex.ts",
-    "points:audit": "tsx src/scripts/audit-points.ts",
-    "nodeloc:extract": "tsx src/scripts/import-nodeloc/extract-nodeloc-sql.ts",
-    "nodeloc:init": "tsx src/scripts/import-nodeloc/initialize-nodeloc.ts"
+    "points:audit": "tsx src/scripts/audit-points.ts"
   },
   "dependencies": {
     "@fastify/cookie": "^11.0.0",

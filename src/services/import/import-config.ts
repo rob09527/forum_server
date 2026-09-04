@@ -13,8 +13,12 @@ export const NODELOC_BASE_URL = 'https://www.nodeloc.com'
 /** 请求 UA(固定,便于对方审计识别;已获站方授权) */
 export const IMPORT_USER_AGENT = 'Mozilla/5.0 (compatible; ForumImportBot/1.0)'
 
-/** 全局限速:两次请求最小间隔(ms),对应 ≤1 req/s 决策 */
-export const REQUEST_MIN_INTERVAL_MS = 1100
+/**
+ * 全局限速:两次 JSON 接口请求最小间隔(ms)。
+ * 500ms(≈2 req/s)是「安全区间」默认值:回填预计 ~20h 量级,又不触碰源站风控边界。
+ * 这是唯一的风控旋钮 —— 运维若见源站返回 429 就往回调(如 800/1100)。
+ */
+export const REQUEST_MIN_INTERVAL_MS = 500
 
 /** 回填窗口:仅导入最近 N 天内创建的主题(决策 7:近 12 个月) */
 export const BACKFILL_WINDOW_DAYS = 365
@@ -36,8 +40,9 @@ export const MAX_IMAGE_REDIRECTS = 3
 /**
  * 静态资源(图片/头像)请求最小间隔(ms),与 JSON 接口分账限速。
  * 理由:/uploads 走 Cloudflare 边缘缓存,不进对方 Rails 应用层,可以比接口稍快。
+ * 与 REQUEST_MIN_INTERVAL_MS 同为风控旋钮,源站 429 时往回调。
  */
-export const ASSET_MIN_INTERVAL_MS = 350
+export const ASSET_MIN_INTERVAL_MS = 250
 
 /** 影子账号邮箱域(决策 13:可追踪、可审计、可下架) */
 export const SHADOW_EMAIL_DOMAIN = 'import.nodeloc.local'
@@ -122,72 +127,3 @@ export const IMPORT_AVATAR_SUBDIR = 'avatars'
 
 /** 增量同步:/posts.json 轮询间隔(ms),计划阶段 3 定为 2 分钟 */
 export const SYNC_POLL_INTERVAL_MS = 120_000
-
-// ──────────────────────────────────────────────────────────────────────
-// 新主题准入:成熟观察期 → 质量门槛 → 每日配额(用户拍板方案 2)
-//
-// 背景:源站新主题若原样实时导入,首页第 1 页(20 条)只覆盖约 8 小时导入内容,
-// 真人发帖会被长期冲掉(见 docs/交接-NodeLoc导入-进度快照-20260903.md §2.5.6)。
-//
-// ⚠️ 为什么必须有「成熟观察期」这一层(实测,别删):
-// 增量 worker 在一楼发出后约 2 分钟就看到该主题,那一刻质量信号**全都还是 0**。
-// 20260903 实测 /latest.json?order=created 两页 60 主题(排除分类后 59 个)按年龄分桶:
-//
-//   age      n    views p50/max   likes p50/max   posts_count p50/max
-//   0-1h     2    16/16           0/0             1/1
-//   1-2h     3    35/54           0/0             2/5
-//   2-4h     6    52/105          2/7             4/11
-//   4-8h    22    96/215          2/16            6/23
-//   8-24h   26    91/304          1/7             9/45
-//
-// 即「首见即判定」会让任何有意义的门槛拒绝 100% 的主题 —— 门槛必须延迟到主题
-// 在源站沉淀过一段时间之后再评估,否则这套机制等于把 worker 关成 0 导入。
-// ──────────────────────────────────────────────────────────────────────
-
-/**
- * 新主题成熟观察期(小时)。首见时只登记进候选池,满这个时长后才评估质量门槛。
- * 取 4h 的依据:上表 4-8h 桶的 views/likes/posts_count 中位数才首次全部离开 0 附近,
- * 再拖长只是推迟导入、并不显著改善信号。
- */
-export const SYNC_TOPIC_MATURITY_HOURS = 4
-
-/**
- * 候选池滞留上限(小时)。超过仍未通过门槛或未抢到配额的主题**永久丢弃**。
- * 作用是给候选池一个硬上界(实测约 111 成熟主题/天,48h 上界 ≈ 池子 ≤ 250 条),
- * 否则「门槛通过量 > 配额」时池子会无限增长。
- */
-export const SYNC_CANDIDATE_TTL_HOURS = 48
-
-/**
- * 质量门槛:三项**同时**达标才准入(信号取自 /t/{id}.json 的 views/like_count/posts_count)。
- * 20260903 实测 48 个已成熟(age≥4h)候选的通过率:
- *   like≥1 views≥60  posts≥2 → 56%   like≥1 views≥80  posts≥3 → 48%
- *   like≥2 views≥100 posts≥3 → 23%   like≥2 views≥120 posts≥4 → 13%
- * 取 23% 一档 ≈ 25 主题/天通过门槛,略高于每日配额 10 ——
- * 刻意让**配额**成为最终约束、门槛只负责滤掉明显没人看的水帖:
- * 若把门槛压到刚好等于配额,选择权就完全交给三个粗糙阈值了。
- */
-export const SYNC_GATE_MIN_VIEWS = 100
-/** 见 SYNC_GATE_MIN_VIEWS */
-export const SYNC_GATE_MIN_LIKES = 2
-/** 见 SYNC_GATE_MIN_VIEWS。posts_count 含一楼,所以 3 = 一楼 + 2 条回复 */
-export const SYNC_GATE_MIN_POSTS_COUNT = 3
-
-/**
- * 每日新主题导入配额(按**本地日期**分桶)。
- * 取 10 的依据:首页第 1 页 20 条,配额 10 保证导入内容占不满首屏的一半,
- * 真人帖在自然发帖量接近 0 的当下仍能留在第 1 页。源站实测约 104 新主题/天,
- * 故配额是强约束(拦掉绝大多数),这正是方案 2 的意图。
- *
- * ⚠️ 只约束**新主题**;评论/编辑/删除不受配额限制(否则已导入主题内容残缺)。
- */
-export const SYNC_DAILY_TOPIC_QUOTA = 10
-
-/**
- * 单轮最多评估多少个成熟候选。每个候选评估要花一次 /t/{id}.json(1.1s 限速),
- * 上限防止池子积压时单轮长时间占着 Redis 锁(锁 TTL 只有 110s)。
- */
-export const SYNC_CANDIDATE_BATCH = 4
-
-// Redis key 已按后端准则⑩ 集中到 `src/constants/redis-keys.ts`:
-// `RedisKey.importSyncCandidates` / `RedisKey.importSyncQuota`。

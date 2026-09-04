@@ -9,12 +9,9 @@ logs/
 public/uploads/*
 !public/uploads/.gitkeep
 
-# 数据快照产物（scripts/import-nodeloc/export-snapshot.sh），几十 MB 起，不入库
-.snapshots/
 public/uploads.bak-*
 
-# 导入流程的断点文件（运行时状态，机器间无意义；误提交会让别人的续跑从别人的进度开始）
-.import-backfill-checkpoint.json
+# 图片回修断点文件（运行时状态，机器间无意义；误提交会让别人的续跑从别人的进度开始）
 .import-repair-checkpoint.json
 
 # 一次性运行时产物（3GB uploads 整包备份 / 文案回修草稿），不入库

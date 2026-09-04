@@ -38,7 +38,7 @@ import path from 'node:path'
 import { prisma } from '../../lib/prisma.js'
 import { fetchNodelocJson } from '../../services/import/nodeloc-client.js'
 import { buildTopicImageMaps, downloadUploadUrl } from '../../services/import/import-images.js'
-import { IMPORT_SOURCE, NODELOC_BASE_URL } from '../../services/import/import-config.js'
+import { ASSET_MIN_INTERVAL_MS, IMPORT_SOURCE, NODELOC_BASE_URL, REQUEST_MIN_INTERVAL_MS } from '../../services/import/import-config.js'
 import type { DiscoursePost, DiscoursePostsResponse } from '../../services/import/nodeloc-types.js'
 
 /** 断点文件路径(**刻意与回填断点不同名**,避免两个流程互相覆盖) */
@@ -85,10 +85,6 @@ function countBadUrls(content: string): number {
     (content.match(REAL_UPLOAD_URL_RE) ?? []).length
   )
 }
-
-/** 实测限速常量,仅用于耗时预估 */
-const JSON_INTERVAL_MS = 1100
-const ASSET_INTERVAL_MS = 350
 
 interface Checkpoint {
   /** 已处理完的源主题 id(升序);续跑时跳过 */
@@ -286,14 +282,14 @@ async function main() {
     for (const c of byTopic.get(id) ?? []) n += countBadUrls(c.content)
     return n
   }, 0)
-  const estMs = todoTopicIds.length * JSON_INTERVAL_MS + todoBadUrlCount * ASSET_INTERVAL_MS
+  const estMs = todoTopicIds.length * REQUEST_MIN_INTERVAL_MS + todoBadUrlCount * ASSET_MIN_INTERVAL_MS
   console.log(
     [
       `[repair] 候选行 ${candidates.length}(posts ${candidates.filter((c) => c.kind === 'post').length} / comments ${candidates.filter((c) => c.kind === 'comment').length})`,
       `[repair] 坏链出现 ${badUrlCount} 处,涉及源楼层 ${floors} 个、源主题 ${allTopicIds.length} 个`,
       `[repair] 本轮待处理主题 ${todoTopicIds.length} 个(断点已完成 ${done.size} 个,--limit 截断 ${allTopicIds.length - done.size - todoTopicIds.length} 个)`,
       `[repair] 预计源站请求:JSON ${todoTopicIds.length} 次 + 图片 ≤${todoBadUrlCount} 次(本轮范围内)`,
-      `[repair] 预计耗时:约 ${(estMs / 60000).toFixed(1)} 分钟(按串行节流 ${JSON_INTERVAL_MS}/${ASSET_INTERVAL_MS}ms 估)`,
+      `[repair] 预计耗时:约 ${(estMs / 60000).toFixed(1)} 分钟(按串行节流 ${REQUEST_MIN_INTERVAL_MS}/${ASSET_MIN_INTERVAL_MS}ms 估)`,
     ].join('\n'),
   )
 

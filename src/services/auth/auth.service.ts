@@ -65,8 +65,6 @@ export const USER_PUBLIC_SELECT = {
   status: true,
   oauthProvider: true,
   createdAt: true,
-  decorAvatarValue: true,
-  decorAvatarExpireAt: true,
   decorColorValue: true,
   decorColorExpireAt: true,
   decorTitleValue: true,
@@ -88,8 +86,6 @@ function toPublic(user: {
   status: string
   oauthProvider: string | null
   createdAt: Date
-  decorAvatarValue: string | null
-  decorAvatarExpireAt: Date | null
   decorColorValue: string | null
   decorColorExpireAt: Date | null
   decorTitleValue: string | null

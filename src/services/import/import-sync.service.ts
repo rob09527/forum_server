@@ -4,25 +4,16 @@ import { redis } from '../../lib/redis.js'
 import { RedisKey } from '../../constants/redis-keys.js'
 import { PointType } from '../../constants/business.js'
 import { fetchNodelocJson } from './nodeloc-client.js'
-import {
-  IMPORT_SOURCE,
-  SYNC_POLL_INTERVAL_MS,
-  SYNC_TOPIC_MATURITY_HOURS,
-  SYNC_CANDIDATE_TTL_HOURS,
-  SYNC_CANDIDATE_BATCH,
-  SYNC_GATE_MIN_VIEWS,
-  SYNC_GATE_MIN_LIKES,
-  SYNC_GATE_MIN_POSTS_COUNT,
-  SYNC_DAILY_TOPIC_QUOTA,
-} from './import-config.js'
+import { IMPORT_SOURCE, SYNC_POLL_INTERVAL_MS } from './import-config.js'
 import { resolveCategory } from './category-map.js'
 import { resolveTopicImages } from './import-images.js'
 import { cleanMarkdown } from './clean-markdown.js'
 import { resolvePostAuthor, getPlaceholderUser } from './shadow-users.js'
-import { importTopic, buildTags, type ImportTopicResult } from './import-topic.js'
+import { importTopic, buildTags } from './import-topic.js'
 import { importEarn } from './import-points.js'
 import { ImportLockLostError } from '../../utils/errors.js'
-import { formatDateKey } from '../points/points.service.js'
+import { runBackfillTick } from './import-backfill.js'
+import { runFabricate } from './import-fabricate.js'
 import { indexPost, removePost } from '../search/search.service.js'
 import type {
   DiscoursePost,
@@ -31,11 +22,20 @@ import type {
 } from './nodeloc-types.js'
 
 /**
- * NodeLoc 增量同步 worker(计划阶段 3):轮询 /posts.json(全站最新 50 条楼层,含 raw),
- * 以对方全局递增 post id 为游标增量消费。决策 5/15:全量持续同步、持续运营。
+ * NodeLoc 数据导入 worker:三阶段状态机 + 增量同步。
  *
- * 事件分派:
- * - 未知主题的任何新楼层 → 整主题全量导入(importTopic)+ 发帖/评论积分重放
+ * 阶段由 Redis 显式标记(importPhase)驱动,跨进程重启可恢复:
+ *   1. backfill(回灌)    —— runBackfillTick:翻 /latest.json 全量历史,逐主题 importTopic,
+ *                           只导内容、不发积分(积分统一交给造数阶段重放)。
+ *   2. fabricate(造数)   —— runFabricate:给已导入的影子内容重放全部积分 + 关注/打赏/装扮,
+ *                           幂等(影子用户已有流水即返回)。
+ *   3. incremental(增量) —— 本文件主责:轮询 /posts.json(全站最新 50 条楼层,含 raw),
+ *                           以对方全局递增 post id 为游标增量消费。决策 5/15:全量持续同步。
+ *
+ * 冷启动(无显式标记)按数据现状推断阶段,见 detectPhase;三种阶段被同一条 SETNX 锁串行化。
+ *
+ * 增量事件分派:
+ * - 未知主题的任何楼层 → 整主题全量导入(importTopic)+ 发帖/评论积分重放
  * - 已知主题的新评论 → 单条落库(楼层分配对齐 comment.service 的 FOR UPDATE 口径)+ 评论积分
  * - 已知楼层 version 升高 → 编辑同步(正文 + 一楼的标题/标签);locked=true(本地管理动作)不覆盖(决策 9)
  * - deleted_at/user_deleted → 删除同步(评论删行减计数;一楼删则整帖下架)
@@ -46,35 +46,8 @@ import type {
  *
  * ⚠️ hidden 的口径(D1):hidden 在 Discourse 多是被 flag 自动折叠的**可逆临时态**,
  * 而本地删除不可逆,所以 hidden **不进删除判据**。但新内容路径与回填严格对齐 ——
- * import-topic.ts:94/118 对 hidden 一楼返回 empty、hidden 回复直接过滤,即回填从不导入
+ * import-topic.ts 对 hidden 一楼返回 empty、hidden 回复直接过滤,即回填从不导入
  * 折叠内容,故这里未导入过的 hidden 楼层同样跳过,避免同一楼层「命运取决于被哪条路径抓到」。
- *
- * ⚠️ 新主题准入三层(用户拍板方案 2「每日配额 + 质量门槛」,20260903):
- * 成熟观察期 → 质量门槛 → 每日配额。阈值全在 import-config.ts,含实测依据。
- *
- * 1. **成熟观察期**:worker 在一楼发出后约 2 分钟就看到主题,那一刻 views/likes/posts_count
- *    **全是 0**(实测分桶见 import-config.ts),首见即判定会让门槛拒绝 100% 的主题。
- *    所以首见只把 topicId 登记进 Redis 候选池(HASH),满 SYNC_TOPIC_MATURITY_HOURS 后再评估。
- * 2. **质量门槛**:成熟后取 /t/{id}.json 的三项信号,同时达标才准入。
- * 3. **每日配额**:达标主题按本地日期计数,用满即当日不再导入新主题。
- *
- * ⚠️ 候选池为什么必须存在(这是「游标跳过即永久丢弃」那个陷阱的正解):
- * 游标是对方全局递增 post id,推进过去就回不来。调度者给的两个口径都有硬伤 ——
- * (a)「配额满就 skip 并推进游标」= 主题永久丢弃,而在有成熟期的前提下**首见时压根还没有
- * 判定依据**,等于随机丢;(b)「停轮不推进游标」= 源站约 104 新主题/天,配额 10 会无限积压
- * 且把评论/编辑/删除一起堵死(它们和新主题共用同一条游标)。
- * 候选池把「主题准入」从游标上**解耦**出来:游标照常推进(评论/编辑/删除永不受影响),
- * 待评估主题活在自己的 HASH 里,可以被反复重评;只有滞留超过 SYNC_CANDIDATE_TTL_HOURS
- * 才**显式丢弃并打日志**。既不丢有价值内容,也不会积压到追不上。
- *
- * ⚠️ 配额只管**新主题**(post_number===1 的未知主题)。两类不受限,都是刻意的:
- * - 已导入主题的新评论/编辑/删除:限了会让本地内容残缺
- * - 未知**旧**主题被顶(post_number>1 的未知主题):importTopic 用对方原始时间落库,
- *   帖子直接落在过去,冲不到首页「最新」,故无需配额。残留风险是它带着对方真实计数
- *   影响 sort=hot,这条与回填产物同源、已在 §2.5.6 记录,不在本次方案范围内。
- *
- * ⚠️ 时序约定:worker 必须在「全量回填 + 阶段 2.5 造数」完成后再启用,
- * 否则造数会与实时积分重放重复计账(见 docs/NodeLoc数据迁移手册.md)。
  *
  * ⚠️ 游标语义(排障必读):游标是**对方全局递增 post id**,存 Redis(无 TTL)。
  * 游标丢失(Redis 被清/换实例)的后果是「跳到最新、丢掉这段增量」,**不是重复计账**——
@@ -84,6 +57,8 @@ import type {
 /** Redis 锁租约时长(秒)，任务可通过续租跨越单轮网络/数据库耗时。 */
 const SYNC_LOCK_TTL_SEC = 180
 const SYNC_LOCK_RENEW_MS = Math.floor((SYNC_LOCK_TTL_SEC * 1000) / 3)
+// 下面三条都是 Lua 脚本：把「读值 + 条件比较 + 写值」压进一次原子执行，
+// 否则拆成 get 再 del/set 之间会被另一个 worker 插队，锁释放/游标推进都会错乱。
 const RELEASE_LOCK_SCRIPT =
   "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end"
 const RENEW_LOCK_SCRIPT =
@@ -93,24 +68,6 @@ const ADVANCE_CURSOR_SCRIPT =
   "local current=redis.call('get', KEYS[2]); " +
   "if current and tonumber(current) and tonumber(current) >= tonumber(ARGV[2]) then return 0 end; " +
   "redis.call('set', KEYS[2], ARGV[2]); return 1"
-const BUMP_QUOTA_SCRIPT =
-  "if redis.call('get', KEYS[1]) ~= ARGV[1] then return -1 end; " +
-  "local current=redis.call('get', KEYS[2]); " +
-  "if current and tonumber(current) and tonumber(current) >= tonumber(ARGV[3]) then return 0 end; " +
-  "local used=redis.call('incr', KEYS[2]); " +
-  "if used == 1 then redis.call('expire', KEYS[2], ARGV[2]) end; " +
-  "return used"
-
-/** Prisma 唯一约束冲突：并发 worker/重试已完成同一来源事件时按幂等成功处理。 */
-function isUniqueViolation(error: unknown): boolean {
-  return (
-    typeof error === 'object' &&
-    error !== null &&
-    'code' in error &&
-    (error as { code?: string }).code === 'P2002'
-  )
-}
-
 /**
  * 同一条 post 连续处理失败多少次后放弃并推进游标。
  * 防毒丸:某条 post 若因对方数据畸形而必然抛错,不加这个阈值会把游标永久钉住,
@@ -184,6 +141,24 @@ export async function planCursor(
 }
 
 /**
+ * 推断当前阶段(仅冷启动兜底;一旦显式写入过 importPhase 就以显式值为准)。
+ * 推断口径依赖数据现状:
+ * - 无任何导入映射 → 回灌还没开始 → backfill
+ * - 有内容但影子用户无积分 → 内容已回灌、还没造数 → fabricate
+ * - 影子用户已有积分 → 造数已完成 → incremental
+ */
+async function detectPhase(): Promise<'backfill' | 'fabricate' | 'incremental'> {
+  const explicit = await redis.get(RedisKey.importPhase(IMPORT_SOURCE))
+  if (explicit === 'backfill' || explicit === 'fabricate' || explicit === 'incremental') {
+    return explicit
+  }
+  const mappingCount = await prisma.importMapping.count()
+  if (mappingCount === 0) return 'backfill'
+  const shadowPointLogCount = await prisma.pointLog.count({ where: { user: { isShadow: true } } })
+  return shadowPointLogCount > 0 ? 'incremental' : 'fabricate'
+}
+
+/**
  * 一次轮询处理的执行入口,由 index.ts 60s 调度器调用。
  * Redis SETNX 锁一石二鸟:多实例单飞 + 节拍降频(见 SYNC_LOCK_TTL_SEC)。
  * 进程崩溃时锁靠 TTL 自动过期,不会永久残留。
@@ -214,9 +189,28 @@ export async function runImportSync(): Promise<void> {
   }, SYNC_LOCK_RENEW_MS)
 
   try {
-    await consumePendingPosts(assertLock, lockKey, owner)
-    assertLock()
-    await processTopicCandidates(assertLock, lockKey, owner)
+    const phase = await detectPhase()
+    if (phase === 'backfill') {
+      // 跑回灌前先显式落 phase=backfill:回灌耗时数小时、跨多轮 tick,期间若进程重启,
+      // 下一轮 detectPhase 会因「已有一批映射、影子无积分」误判成 fabricate,回灌被截断。
+      // 显式标记让这种中断可恢复(重启后仍回 backfill,从页游标续跑)。
+      await redis.set(RedisKey.importPhase(IMPORT_SOURCE), 'backfill')
+      const result = await runBackfillTick(assertLock)
+      assertLock()
+      if (result === 'done') {
+        await redis.set(RedisKey.importPhase(IMPORT_SOURCE), 'fabricate')
+        await redis.del(RedisKey.importBackfillPage(IMPORT_SOURCE))
+      }
+    } else if (phase === 'fabricate') {
+      // 同理先显式落 phase=fabricate:造数中途崩溃会留下部分流水,detectPhase 会误判
+      // 成 incremental 而跳过剩余造数。显式标记后重跑 runFabricate 靠幂等重放补齐。
+      await redis.set(RedisKey.importPhase(IMPORT_SOURCE), 'fabricate')
+      await runFabricate(assertLock)
+      assertLock()
+      await redis.set(RedisKey.importPhase(IMPORT_SOURCE), 'incremental')
+    } else {
+      await consumePendingPosts(assertLock, lockKey, owner)
+    }
   } finally {
     clearInterval(renewTimer)
     await redis.eval(RELEASE_LOCK_SCRIPT, 1, lockKey, owner).catch((err: unknown) => {
@@ -301,10 +295,8 @@ export type SyncAction =
       fromVersion: number
       toVersion: number
     }
-  /** 未知**旧**主题被顶:整主题导入 + 积分重放,不受门槛/配额约束(见文件头) */
+  /** 未知主题(新一楼或旧主题被顶):整主题导入 + 积分重放 */
   | { kind: 'import-topic'; topicId: number }
-  /** 未知**新**主题(一楼首见):只登记进候选池,等成熟期后再评估门槛与配额 */
-  | { kind: 'defer-topic'; topicId: number }
   /** 已知主题的新评论:parentId=null 为顶层楼层,否则挂在顶层祖先下 */
   | { kind: 'append-comment'; localPostId: number; parentId: number | null }
 
@@ -373,15 +365,9 @@ export async function planOnePost(post: DiscoursePost): Promise<SyncAction> {
   })
 
   if (!topicMapping) {
-    // 主题已在候选池:它的其它楼层此刻也一律不处理 —— 等成熟期评估通过后由
-    // importTopic 把整主题(含这些楼层)一次性导入。漏了这条守卫,一楼被延迟的
-    // 同时它的回复会从下面的「旧主题被顶」分支把整主题无门槛导进来,延迟形同虚设。
-    if (await isPooledTopic(post.topic_id)) {
-      return { kind: 'skip', reason: `主题 ${post.topic_id} 在候选池待评估,本楼层随主题一起导入` }
-    }
-    // 一楼首见 = 真正的新主题 → 走三层准入;post_number>1 的未知主题 = 旧主题被顶,
-    // 用对方原始时间落库、冲不到首页,直接导入(见文件头)
-    if (post.post_number === 1) return { kind: 'defer-topic', topicId: post.topic_id }
+    // 未知主题(不论新一楼还是被顶的旧主题):整主题导入 + 积分重放。
+    // 旧主题被顶(post_number>1)时 importTopic 用对方原始时间落库、帖子直接落在过去,
+    // 冲不到首页「最新」;新主题(post_number===1)同样走 importTopic。
     return { kind: 'import-topic', topicId: post.topic_id }
   }
 
@@ -395,306 +381,6 @@ export async function planOnePost(post: DiscoursePost): Promise<SyncAction> {
     kind: 'append-comment',
     localPostId: topicMapping.localPostId,
     parentId: await resolveParentComment(post),
-  }
-}
-
-// ──────────────────────────────────────────────────────────────────────
-// 候选池:新主题的成熟观察期 + 质量门槛 + 每日配额
-// ──────────────────────────────────────────────────────────────────────
-
-/** 候选池条目(存成 JSON 字符串) */
-interface CandidateEntry {
-  /** 首见时间(epoch ms),用于算滞留时长 → TTL 丢弃 */
-  f: number
-  /** 下次评估时间(epoch ms)。首见时 = f + 成熟期;门槛未过则顺延一个成熟期后重评 */
-  n: number
-}
-
-/** 主题是否已在候选池(只读) */
-async function isPooledTopic(topicId: number): Promise<boolean> {
-  const raw = await redis.hget(RedisKey.importSyncCandidates(IMPORT_SOURCE), String(topicId))
-  return raw !== null
-}
-
-/** 当日已用配额(只读)。计数器不存在视为 0 */
-export async function readQuotaUsed(): Promise<number> {
-  const raw = await redis.get(RedisKey.importSyncQuota(IMPORT_SOURCE, formatDateKey(new Date())))
-  const used = Number(raw)
-  // 被写脏时按「已用满」处理:宁可当天不导,也不要因 NaN 比较恒 false 而无限导入
-  if (raw !== null && !Number.isFinite(used)) return SYNC_DAILY_TOPIC_QUOTA
-  return Number.isFinite(used) ? used : 0
-}
-
-/** 单个成熟候选的评估结果 */
-export interface CandidateDecision {
-  topicId: number
-  /** 首见至今的滞留小时数 */
-  ageHours: number
-  /** 门槛信号(fetch 失败时为 null) */
-  signals: { views: number; likes: number; postsCount: number } | null
-  verdict:
-    | { kind: 'import' } // 门槛+配额都过 → 导入
-    | { kind: 'reject-gate'; reason: string } // 门槛未过 → 顺延重评(或到期丢弃)
-    | { kind: 'drop-expired'; reason: string } // 滞留超上限 → 永久丢弃
-    | { kind: 'drop-missing' } // 主题在对方站已不可见(404/403)→ 丢弃
-    | { kind: 'drop-excluded' } // 成熟后发现属排除分类 → 丢弃
-}
-
-/** 本轮候选池的整体决策(只读) */
-export interface CandidatePlan {
-  /** 池内总条目数 */
-  poolSize: number
-  /** 当日已用配额 / 上限 */
-  quotaUsed: number
-  quotaLimit: number
-  /** 配额已用满 → 本轮完全不评估(省掉源站请求),池子原样保留到明天 */
-  quotaExhausted: boolean
-  /** 已到评估时间的候选数(未受 batch 截断前) */
-  matured: number
-  /** 本轮实际评估的决策,按首见时间升序(先到先得) */
-  decisions: CandidateDecision[]
-}
-
-/** 干跑用的替身输入(与 planCursor 的 override 同一用意:复现/演练而不写状态) */
-export interface CandidatePlanOverride {
-  /** 替代 Redis 候选池内容,field=topicId、value=CandidateEntry 的 JSON */
-  pool?: Record<string, string>
-  /** 替代当日已用配额 */
-  quotaUsed?: number
-}
-
-/**
- * 候选池评估(**纯只读**:读 Redis 池与配额、抓 /t/{id}.json,不写任何一处)。
- * 导出给 sync-dryrun.ts;生产路径 processTopicCandidates 也走它,判定只有这一份实现。
- *
- * 配额检查刻意放在抓取**之前**:用满就直接返回,一次源站请求都不发。
- * `override` 只给干跑用 —— 池子空的时候(worker 从未跑过)否则无从演示门槛与配额的判定。
- */
-export async function planTopicCandidates(
-  override?: CandidatePlanOverride,
-): Promise<CandidatePlan> {
-  const pool = override?.pool ?? (await redis.hgetall(RedisKey.importSyncCandidates(IMPORT_SOURCE)))
-  const quotaUsed = override?.quotaUsed ?? (await readQuotaUsed())
-  const base: CandidatePlan = {
-    poolSize: Object.keys(pool).length,
-    quotaUsed,
-    quotaLimit: SYNC_DAILY_TOPIC_QUOTA,
-    quotaExhausted: quotaUsed >= SYNC_DAILY_TOPIC_QUOTA,
-    matured: 0,
-    decisions: [],
-  }
-  if (base.quotaExhausted || base.poolSize === 0) return base
-
-  const now = Date.now()
-  const entries: { topicId: number; entry: CandidateEntry }[] = []
-  for (const [field, raw] of Object.entries(pool)) {
-    const topicId = Number(field)
-    let entry: CandidateEntry | null = null
-    try {
-      entry = JSON.parse(raw) as CandidateEntry
-    } catch {
-      entry = null
-    }
-    // 条目损坏(手工改过/旧格式)按「刚首见」重置,而不是当场丢弃主题
-    if (!entry || !Number.isFinite(entry.f) || !Number.isFinite(entry.n)) {
-      entry = { f: now, n: now + SYNC_TOPIC_MATURITY_HOURS * 3600_000 }
-    }
-    if (!Number.isFinite(topicId)) continue
-    if (entry.n > now) continue // 还没到评估时间
-    entries.push({ topicId, entry })
-  }
-  entries.sort((a, b) => a.entry.f - b.entry.f) // 先到先得
-  base.matured = entries.length
-
-  const ttlMs = SYNC_CANDIDATE_TTL_HOURS * 3600_000
-  let remaining = SYNC_DAILY_TOPIC_QUOTA - quotaUsed
-
-  for (const { topicId, entry } of entries.slice(0, SYNC_CANDIDATE_BATCH)) {
-    const ageHours = (now - entry.f) / 3600_000
-    const expired = now - entry.f >= ttlMs
-
-    const topic = await fetchNodelocJson<DiscourseTopicDetail>(`/t/${topicId}.json`)
-    if (!topic) {
-      base.decisions.push({ topicId, ageHours, signals: null, verdict: { kind: 'drop-missing' } })
-      continue
-    }
-    const category = await resolveCategory(topic.category_id)
-    if (category.excluded) {
-      base.decisions.push({ topicId, ageHours, signals: null, verdict: { kind: 'drop-excluded' } })
-      continue
-    }
-
-    const signals = {
-      views: topic.views ?? 0,
-      likes: topic.like_count ?? 0,
-      postsCount: topic.posts_count ?? 0,
-    }
-    const misses: string[] = []
-    if (signals.views < SYNC_GATE_MIN_VIEWS) misses.push(`views ${signals.views}<${SYNC_GATE_MIN_VIEWS}`)
-    if (signals.likes < SYNC_GATE_MIN_LIKES) misses.push(`likes ${signals.likes}<${SYNC_GATE_MIN_LIKES}`)
-    if (signals.postsCount < SYNC_GATE_MIN_POSTS_COUNT) {
-      misses.push(`posts_count ${signals.postsCount}<${SYNC_GATE_MIN_POSTS_COUNT}`)
-    }
-
-    if (misses.length > 0) {
-      base.decisions.push({
-        topicId,
-        ageHours,
-        signals,
-        verdict: expired
-          ? { kind: 'drop-expired', reason: `滞留 ${ageHours.toFixed(1)}h 仍未达标(${misses.join('、')})` }
-          : { kind: 'reject-gate', reason: misses.join('、') },
-      })
-      continue
-    }
-
-    // 门槛过了但配额已被本轮前面的候选吃完 → 留在池里等下一个评估窗口;
-    // 除非已到滞留上限,那才丢弃(否则池子会因「达标量>配额」无限增长)
-    if (remaining <= 0) {
-      base.decisions.push({
-        topicId,
-        ageHours,
-        signals,
-        verdict: expired
-          ? { kind: 'drop-expired', reason: `滞留 ${ageHours.toFixed(1)}h 且始终未抢到配额` }
-          : { kind: 'reject-gate', reason: '达标但当日配额已用满,顺延重评' },
-      })
-      continue
-    }
-
-    remaining--
-    base.decisions.push({ topicId, ageHours, signals, verdict: { kind: 'import' } })
-  }
-  return base
-}
-
-/**
- * 候选池执行:判定交给 planTopicCandidates,这里只落副作用
- * (导入主题 / 递增配额 / 增删候选池条目)。
- */
-async function processTopicCandidates(
-  assertLock: () => void,
-  lockKey: string,
-  owner: string,
-): Promise<void> {
-  assertLock()
-  const plan = await planTopicCandidates()
-  assertLock()
-  if (plan.quotaExhausted) {
-    if (plan.poolSize > 0) {
-      console.log(
-        `[import-sync] 当日新主题配额已用满(${plan.quotaUsed}/${plan.quotaLimit}),` +
-          `候选池 ${plan.poolSize} 条留待明日`,
-      )
-    }
-    return
-  }
-  if (plan.decisions.length === 0) return
-
-  const poolKey = RedisKey.importSyncCandidates(IMPORT_SOURCE)
-  const now = Date.now()
-
-  for (const d of plan.decisions) {
-    assertLock()
-    switch (d.verdict.kind) {
-      case 'import': {
-        let result: ImportTopicResult
-        try {
-          result = await importTopic(d.topicId)
-        } catch (err) {
-          if (!isUniqueViolation(err)) throw err
-          // 另一轮已先完成同一主题：重新读取映射，继续幂等的积分/索引/候选收尾。
-          const existing = await prisma.importMapping.findFirst({
-            where: { source: IMPORT_SOURCE, sourceTopicId: d.topicId, localPostId: { not: null } },
-            select: { localPostId: true },
-          })
-          if (!existing?.localPostId) throw err
-          result = { status: 'skipped', localPostId: existing.localPostId }
-        }
-        assertLock()
-        if (!result.localPostId || (result.status !== 'imported' && result.status !== 'skipped')) {
-          break
-        }
-        await replayTopicPoints(result.localPostId, assertLock)
-        assertLock()
-        if (result.status === 'imported') await reindexPost(result.localPostId)
-        assertLock()
-        await bumpQuota(RedisKey.importSyncLock, owner)
-        assertLock()
-        await redis.hdel(poolKey, String(d.topicId))
-        console.log(
-          `[import-sync] 新主题 ${d.topicId} 准入(观察 ${d.ageHours.toFixed(1)}h,` +
-            `views=${d.signals?.views} likes=${d.signals?.likes} posts=${d.signals?.postsCount}),` +
-            `配额 ${(await readQuotaUsed())}/${plan.quotaLimit}`,
-        )
-        break
-      }
-      case 'reject-gate':
-        assertLock()
-        // 顺延一个成熟期后重评:信号只会随时间增长,现在不达标不代表明天不达标
-        await redis.hset(
-          poolKey,
-          String(d.topicId),
-          JSON.stringify({
-            f: now - d.ageHours * 3600_000,
-            n: now + SYNC_TOPIC_MATURITY_HOURS * 3600_000,
-          } satisfies CandidateEntry),
-        )
-        break
-      case 'drop-expired':
-        assertLock()
-        await redis.hdel(poolKey, String(d.topicId))
-        console.log(`[import-sync] 新主题 ${d.topicId} **永久丢弃**:${d.verdict.reason}`)
-        break
-      case 'drop-missing':
-        assertLock()
-        await redis.hdel(poolKey, String(d.topicId))
-        console.log(`[import-sync] 新主题 ${d.topicId} 丢弃:对方站已不可见(404/403)`)
-        break
-      case 'drop-excluded':
-        assertLock()
-        await redis.hdel(poolKey, String(d.topicId))
-        console.log(`[import-sync] 新主题 ${d.topicId} 丢弃:成熟后判定属排除分类`)
-        break
-    }
-  }
-}
-
-/**
- * 递增当日配额计数器。TTL 取 48h(> 1 天),让计数器自然过期而不用手工清理;
- * 只在 key 首次创建时设 TTL,避免每次递增都把过期时间往后推。
- */
-async function bumpQuota(lockKey: string, owner: string): Promise<void> {
-  const key = RedisKey.importSyncQuota(IMPORT_SOURCE, formatDateKey(new Date()))
-  const used = Number(
-    await redis.eval(
-      BUMP_QUOTA_SCRIPT,
-      2,
-      lockKey,
-      key,
-      owner,
-      String(48 * 3600),
-      String(SYNC_DAILY_TOPIC_QUOTA),
-    ),
-  )
-  if (used < 0) throw new ImportLockLostError()
-  // 0 means the quota was already full (normally a retry after a crash that
-  // happened after the first bump); the candidate can still be finalized.
-}
-
-/** 把首见的新主题登记进候选池(幂等:已在池里则不覆盖,以免刷新首见时间导致永不到期) */
-async function poolNewTopic(topicId: number, assertLock: () => void): Promise<void> {
-  assertLock()
-  const now = Date.now()
-  const added = await redis.hsetnx(
-    RedisKey.importSyncCandidates(IMPORT_SOURCE),
-    String(topicId),
-    JSON.stringify({ f: now, n: now + SYNC_TOPIC_MATURITY_HOURS * 3600_000 } satisfies CandidateEntry),
-  )
-  if (added) {
-    console.log(
-      `[import-sync] 新主题 ${topicId} 进入候选池,${SYNC_TOPIC_MATURITY_HOURS}h 后评估质量门槛`,
-    )
   }
 }
 
@@ -712,8 +398,6 @@ async function syncOnePost(post: DiscoursePost, assertLock: () => void): Promise
       return updateSyncedContent(action.mappingId, post, action.toVersion, assertLock)
     case 'append-comment':
       return appendComment(post, action.localPostId, action.parentId, assertLock)
-    case 'defer-topic':
-      return poolNewTopic(action.topicId, assertLock)
     case 'import-topic': {
       const result = await importTopic(action.topicId)
       assertLock()

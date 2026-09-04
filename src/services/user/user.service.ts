@@ -115,7 +115,8 @@ export interface NewUserItem {
  * - isShadow=false：导入的影子用户 createdAt = 其在对方站首次发言时间，而回填是从最新页往回走，
  *   活跃影子会被赋上「最近几天」的注册时间，不排除会把「欢迎新用户」整块刷爆（终局 3 万影子 vs 几百真人）。
  * - status=active：封禁/禁言账号不该出现在欢迎位。
- * 走 users(isShadow, createdAt DESC) 复合索引，等值前缀 + 有序后缀，无需排序回表。
+ * 走 users(isShadow, createdAt DESC) 复合索引：isShadow 等值前缀 + createdAt 有序后缀，免排序回表；
+ * status=active 是附加过滤（不纳入该索引前缀，真人量级小可接受）。
  */
 export async function getLatestUsers(limit = 8): Promise<NewUserItem[]> {
   const take = Math.min(50, Math.max(1, limit))
@@ -124,7 +125,7 @@ export async function getLatestUsers(limit = 8): Promise<NewUserItem[]> {
     where: { isShadow: false, status: UserStatus.ACTIVE },
     orderBy: { createdAt: 'desc' },
     take,
-    select: { id: true, username: true, avatar: true, decorAvatarValue: true, decorAvatarExpireAt: true, createdAt: true },
+    select: { id: true, username: true, avatar: true, createdAt: true },
   })
 
   return users.map((u) => ({
@@ -186,8 +187,6 @@ export async function searchUsers(
       id: true,
       username: true,
       avatar: true,
-      decorAvatarValue: true,
-      decorAvatarExpireAt: true,
       level: true,
     },
   })
@@ -239,8 +238,6 @@ export async function getUserProfile(userId: number, viewerId?: number): Promise
       followerCount: true,
       followingCount: true,
       createdAt: true,
-      decorAvatarValue: true,
-      decorAvatarExpireAt: true,
       decorColorValue: true,
       decorColorExpireAt: true,
       decorTitleValue: true,

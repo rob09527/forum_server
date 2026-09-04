@@ -1,0 +1,33 @@
+# forum 业务数据快照
+生成时间: 2026-09-03 00:18:24 +0800
+来源库:   forum
+pg_dump:  pg_dump (PostgreSQL) 18.4 (Homebrew)
+表数量:   21
+不含:     base_sys_*(Cool Admin / TypeORM)、_prisma_migrations
+
+## 各表行数
+adverts                    1
+announcements              2
+bookmarks                  0
+bounties                   0
+categories                 14
+comment_likes              0
+comments                   3175
+conversations              0
+follows                    0
+import_mappings            3420
+import_user_mappings       575
+messages                   0
+notification_messages      0
+notifications              0
+point_logs                 0
+post_likes                 0
+posts                      245
+shop_items                 397
+tips                       0
+user_decorations           0
+users                      576
+
+## uploads
+目录体积: 23M
+文件数:   597

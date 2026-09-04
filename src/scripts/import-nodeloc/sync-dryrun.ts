@@ -8,21 +8,12 @@ import {
   IMPORT_SOURCE,
   EXCLUDED_CATEGORY_IDS,
   SYNC_POLL_INTERVAL_MS,
-  SYNC_TOPIC_MATURITY_HOURS,
-  SYNC_CANDIDATE_TTL_HOURS,
-  SYNC_CANDIDATE_BATCH,
-  SYNC_GATE_MIN_VIEWS,
-  SYNC_GATE_MIN_LIKES,
-  SYNC_GATE_MIN_POSTS_COUNT,
-  SYNC_DAILY_TOPIC_QUOTA,
 } from '../../services/import/import-config.js'
 import { resolveCategory } from '../../services/import/category-map.js'
 import {
   fetchLatestPosts,
   planCursor,
   planOnePost,
-  planTopicCandidates,
-  type CandidatePlanOverride,
   type SyncAction,
 } from '../../services/import/import-sync.service.js'
 import type {
@@ -54,17 +45,6 @@ import type {
  *   pnpm tsx src/scripts/import-nodeloc/sync-dryrun.ts
  *   pnpm tsx src/scripts/import-nodeloc/sync-dryrun.ts --cursor=12345   # 手工指定起点复现
  *   pnpm tsx src/scripts/import-nodeloc/sync-dryrun.ts --limit=10       # 只看前 10 条决策
- *
- * 新主题准入三层(任务 L)的演练:真实候选池初始为空,所以门槛/配额两层需要替身输入
- * (`planTopicCandidates(override)`,只替换**输入**,判定代码仍是生产那一份):
- *   --simulate-topics=105140,105141   # 假装这些对方 topicId 在池中且已成熟
- *   --simulate-age-hours=50           # 模拟滞留时长,≥SYNC_CANDIDATE_TTL_HOURS 演练永久丢弃
- *   --quota-used=10                   # 假装当日配额已用满,验证「用满即不发源站请求」
- *
- * ⚠️ 干跑特有的假象(不是 bug,别照着改代码):同一轮里若某主题的一楼判为 defer-topic、
- * 它后面的楼层又出现在同一页,干跑会把后者判成 import-topic。原因是干跑**不写候选池**,
- * `planOnePost` 里的 isPooledTopic 守卫查不到这一条。真实执行是「按 id 升序逐条处理」,
- * 一楼的 poolNewTopic 已 HSETNX 写入,后续楼层会正确落到 skip。
  */
 
 /** 命令行参数 */
@@ -73,12 +53,6 @@ interface DryRunArgs {
   cursor?: number
   /** 最多输出多少条 pending 的决策明细(默认全部) */
   limit?: number
-  /** 演练用:假装候选池里有这些对方 topicId(已成熟),不写 Redis */
-  simulateTopics?: number[]
-  /** 演练用:模拟候选已在池中滞留多少小时(默认 maturity+1;≥TTL 可演练永久丢弃) */
-  simulateAgeHours?: number
-  /** 演练用:假装当日配额已用掉 N 个 */
-  quotaUsed?: number
 }
 
 function parseArgs(argv: string[]): DryRunArgs {
@@ -88,12 +62,6 @@ function parseArgs(argv: string[]): DryRunArgs {
     if (cursor) args.cursor = Number(cursor[1])
     const limit = /^--limit=(\d+)$/.exec(a)
     if (limit) args.limit = Number(limit[1])
-    const sim = /^--simulate-topics=([\d,]+)$/.exec(a)
-    if (sim) args.simulateTopics = sim[1]!.split(',').filter(Boolean).map(Number)
-    const age = /^--simulate-age-hours=(\d+)$/.exec(a)
-    if (age) args.simulateAgeHours = Number(age[1])
-    const quota = /^--quota-used=(\d+)$/.exec(a)
-    if (quota) args.quotaUsed = Number(quota[1])
     // --once / --dry-run 是语义声明:本入口天然只跑一轮且只读,接受但无需处理
   }
   return args
@@ -154,16 +122,6 @@ async function describeEffects(post: DiscoursePost, action: SyncAction): Promise
       out.push(`正文:raw ${post.raw?.length ?? 0} 字符(干跑不做清洗/图片下载,故不预览)`)
       break
     }
-
-    case 'defer-topic':
-      out.push(
-        `[预测] 新主题 ${action.topicId} 只登记进候选池(Redis HASH,不导入任何内容):` +
-          `${SYNC_TOPIC_MATURITY_HOURS}h 后才评估质量门槛`,
-      )
-      out.push(
-        '[预测] 一行库都不写;该主题此刻的 views/likes/posts_count 还接近 0,现在判定必然误杀',
-      )
-      break
 
     case 'import-topic': {
       const topic = await fetchNodelocJson<DiscourseTopicDetail>(`/t/${action.topicId}.json`)
@@ -277,94 +235,11 @@ async function describeEffects(post: DiscoursePost, action: SyncAction): Promise
   return out
 }
 
-/**
- * 新主题准入三层的判定结果(任务 L 的唯一验证手段)。
- * 决策全部来自 service 的 planTopicCandidates(只读),这里只负责排版。
- */
-async function reportCandidates(): Promise<void> {
-  const args = parseArgs(process.argv.slice(2))
-
-  console.log('\n═══ 新主题准入:成熟期 → 质量门槛 → 每日配额 ═══')
-  console.log(
-    `配置:成熟期 ${SYNC_TOPIC_MATURITY_HOURS}h、滞留上限 ${SYNC_CANDIDATE_TTL_HOURS}h、` +
-      `单轮评估上限 ${SYNC_CANDIDATE_BATCH} 个;门槛 views≥${SYNC_GATE_MIN_VIEWS} ` +
-      `且 likes≥${SYNC_GATE_MIN_LIKES} 且 posts_count≥${SYNC_GATE_MIN_POSTS_COUNT};` +
-      `每日配额 ${SYNC_DAILY_TOPIC_QUOTA} 个新主题`,
-  )
-  console.log(
-    `Redis key:候选池 ${RedisKey.importSyncCandidates(IMPORT_SOURCE)}、` +
-      `配额 ${RedisKey.importSyncQuota(IMPORT_SOURCE, '<本地日期>')}`,
-  )
-
-  // 池子为空时(worker 从未跑过)用 --simulate-topics 造一份**内存里的**替身池,
-  // 让门槛/配额两层的判定代码真的跑起来。仍然一个字节都不写 Redis。
-  let override: CandidatePlanOverride | undefined
-  if (args.simulateTopics?.length || args.quotaUsed !== undefined) {
-    const ageHours = args.simulateAgeHours ?? SYNC_TOPIC_MATURITY_HOURS + 1
-    const firstSeen = Date.now() - ageHours * 3600_000
-    const pool: Record<string, string> = {}
-    for (const id of args.simulateTopics ?? []) {
-      // n 取「首见 + 成熟期」= 已到评估时间;f 决定滞留时长(≥TTL 则演练永久丢弃)
-      pool[String(id)] = JSON.stringify({
-        f: firstSeen,
-        n: firstSeen + SYNC_TOPIC_MATURITY_HOURS * 3600_000,
-      })
-    }
-    // 只给 --quota-used 时不要把真实池子替换成空池
-    override = {
-      pool: args.simulateTopics?.length ? pool : undefined,
-      quotaUsed: args.quotaUsed,
-    }
-    console.log(
-      `⚙️ 演练模式:${args.simulateTopics?.length ? `替身候选池 ${Object.keys(pool).length} 条(模拟滞留 ${ageHours}h)` : '沿用真实候选池'}` +
-        `${args.quotaUsed !== undefined ? `、假定已用配额 ${args.quotaUsed}` : ''};Redis 仍然只读不写`,
-    )
-  }
-
-  const plan = await planTopicCandidates(override)
-  console.log(
-    `候选池现有 ${plan.poolSize} 条;当日配额已用 ${plan.quotaUsed}/${plan.quotaLimit}` +
-      `${plan.quotaExhausted ? ' → 已用满,本轮不评估、不发任何源站请求,池子留待明日' : ''}`,
-  )
-  if (plan.quotaExhausted || plan.poolSize === 0) return
-  console.log(`已到评估时间(成熟)的候选 ${plan.matured} 条,本轮展开 ${plan.decisions.length} 条:`)
-
-  for (const d of plan.decisions) {
-    const sig = d.signals
-      ? `views=${d.signals.views} likes=${d.signals.likes} posts_count=${d.signals.postsCount}`
-      : '(信号不可用)'
-    console.log(`\n── 主题 ${d.topicId} 观察 ${d.ageHours.toFixed(1)}h ${sig}`)
-    switch (d.verdict.kind) {
-      case 'import':
-        console.log('   【门槛通过 + 抢到配额】→ [预测] importTopic 全量导入 + 积分重放 + 建索引')
-        console.log('   [预测] 配额 +1(导入成功后才扣);候选池删除该条')
-        break
-      case 'reject-gate':
-        console.log(`   【门槛拦下】${d.verdict.reason}`)
-        console.log(
-          `   [预测] 不导入、不丢弃:候选池顺延 ${SYNC_TOPIC_MATURITY_HOURS}h 后重评` +
-            `(信号只会随时间增长),滞留满 ${SYNC_CANDIDATE_TTL_HOURS}h 才永久丢弃`,
-        )
-        break
-      case 'drop-expired':
-        console.log(`   【永久丢弃】${d.verdict.reason}`)
-        console.log('   [预测] 候选池删除该条并打日志;游标早已推过,此主题不再有机会')
-        break
-      case 'drop-missing':
-        console.log('   【丢弃】对方站已不可见(404/403)')
-        break
-      case 'drop-excluded':
-        console.log('   【丢弃】成熟后判定属排除分类(A7)')
-        break
-    }
-  }
-}
-
 /** /posts.json 楼层消费那一轮的判定(A1/A3/A7) */
 async function reportPostsRound(): Promise<void> {
   const args = parseArgs(process.argv.slice(2))
 
-  console.log('═══ 增量 worker 单轮干跑(只读,不写库、不写 Redis 游标/候选池/配额)═══')
+  console.log('═══ 增量 worker 单轮干跑(只读,不写库、不写 Redis 游标)═══')
   console.log(
     `轮询间隔配置 ${SYNC_POLL_INTERVAL_MS}ms;排除分类 id:[${[...EXCLUDED_CATEGORY_IDS].join(', ')}]`,
   )
@@ -431,15 +306,9 @@ async function reportPostsRound(): Promise<void> {
   }
 }
 
-/**
- * 两个阶段都跑:楼层消费 + 候选池评估。
- * 真实 worker 里候选池评估同样是**无条件**跑的(与本轮有没有新楼层无关),
- * 所以这里也不放在楼层阶段的条件分支里。
- */
 async function main(): Promise<void> {
   await reportPostsRound()
-  await reportCandidates()
-  console.log('\n干跑结束:未写入任何数据库行,Redis 游标/候选池/配额均保持不变。')
+  console.log('\n干跑结束:未写入任何数据库行,Redis 游标保持不变。')
 }
 
 main()
