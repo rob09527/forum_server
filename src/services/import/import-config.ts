@@ -127,3 +127,23 @@ export const IMPORT_AVATAR_SUBDIR = 'avatars'
 
 /** 增量同步:/posts.json 轮询间隔(ms),计划阶段 3 定为 2 分钟 */
 export const SYNC_POLL_INTERVAL_MS = 120_000
+
+// ──────────────────────────────────────────────────────────────────────
+// 增量对账(reconcile):对最近帖子补拉源站新评论的安全网旁路。
+//
+// /posts.json 只给全站最新 50 条,评论高速涌入时新评论会被挤出窗口、游标跳过而永久丢失;
+// 对账按「源站发帖时间 + 热度」圈一个有限的追踪池,周期性只读 diff、补缺口评论。
+// 口径(用户拍板):窗口内主题按热度降序截断到 RECONCILE_MAX_TOPICS;只补新评论,不做编辑/删除。
+// ──────────────────────────────────────────────────────────────────────
+
+/** 增量对账:追踪窗口(天),仅对源站最近 N 天内创建的主题补拉新评论(可调) */
+export const RECONCILE_WINDOW_DAYS = 2
+
+/** 增量对账:追踪池上限,窗口内主题超此数按热度截断,只追踪最热的 N 条(可调) */
+export const RECONCILE_MAX_TOPICS = 500
+
+/** 增量对账:单轮最多处理主题数(节流,防一轮独占锁/打满源站限速) */
+export const RECONCILE_BATCH_SIZE = 25
+
+/** 增量对账:单轮时间预算(ms),到点返回下轮继续(对齐 import-backfill 的 BACKFILL_BUDGET_MS 模式) */
+export const RECONCILE_BUDGET_MS = 30_000

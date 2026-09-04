@@ -18,8 +18,8 @@ import type { DiscourseTopicDetail, DiscoursePost, DiscoursePostsResponse } from
  * heatScore 按物化公式本地算;PointLog 不在此写(阶段 2.5 造数统一重放)。
  */
 
-/** 补楼批大小(post_ids[] 查询串长度可控,Discourse 单批上限 300 内) */
-const POSTS_BATCH_SIZE = 200
+/** 补楼批大小(post_ids[] 查询串长度可控,Discourse 单批上限 300 内)。导出供对账(reconcile)复用同一批量。 */
+export const POSTS_BATCH_SIZE = 200
 
 /** 导入结果状态 */
 export type ImportTopicStatus = 'imported' | 'skipped' | 'excluded' | 'missing' | 'empty' | 'filtered'

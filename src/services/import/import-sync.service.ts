@@ -2,24 +2,33 @@ import { randomUUID } from 'node:crypto'
 import { prisma } from '../../lib/prisma.js'
 import { redis } from '../../lib/redis.js'
 import { RedisKey } from '../../constants/redis-keys.js'
-import { PointType } from '../../constants/business.js'
+import { PointType, ShopItemType } from '../../constants/business.js'
 import { fetchNodelocJson } from './nodeloc-client.js'
-import { IMPORT_SOURCE, SYNC_POLL_INTERVAL_MS } from './import-config.js'
+import {
+  IMPORT_SOURCE,
+  SYNC_POLL_INTERVAL_MS,
+  RECONCILE_WINDOW_DAYS,
+  RECONCILE_MAX_TOPICS,
+  RECONCILE_BATCH_SIZE,
+  RECONCILE_BUDGET_MS,
+} from './import-config.js'
 import { resolveCategory } from './category-map.js'
 import { resolveTopicImages } from './import-images.js'
 import { cleanMarkdown } from './clean-markdown.js'
 import { containsBannedContent } from './content-filter.js'
 import { resolvePostAuthor, getPlaceholderUser } from './shadow-users.js'
-import { importTopic, buildTags } from './import-topic.js'
+import { importTopic, buildTags, POSTS_BATCH_SIZE } from './import-topic.js'
 import { importEarn } from './import-points.js'
 import { ImportLockLostError } from '../../utils/errors.js'
 import { runBackfillTick } from './import-backfill.js'
 import { runFabricate } from './import-fabricate.js'
 import { indexPost, removePost } from '../search/search.service.js'
+import { buyDecoration } from '../shop/shop.service.js'
 import type {
   DiscoursePost,
   DiscourseLatestPostsResponse,
   DiscourseTopicDetail,
+  DiscoursePostsResponse,
 } from './nodeloc-types.js'
 
 /**
@@ -75,6 +84,14 @@ const ADVANCE_CURSOR_SCRIPT =
  * 之后所有增量都同步不进来(比丢一条严重得多)。
  */
 const MAX_POST_RETRIES = 3
+
+/**
+ * 增量随机消费:影子用户余额超过此阈值(鸡腿)后,按概率随机触发一次商店购买。
+ * 阈值 300 = 用户拍板的「大于 300 随机买一次」;概率 0.5 是随机触发的「随机」来源,
+ * 买完后余额回落、低于阈值即自动停,天然节奏化,不会一过阈值就连买。
+ */
+const INCREMENTAL_SHOP_PURCHASE_MIN_POINTS = 300
+const INCREMENTAL_SHOP_PURCHASE_PROB = 0.5
 
 /** 进程内失败计数:sourcePostId → 连续失败次数(单实例 worker,无需持久化) */
 const failureCount = new Map<number, number>()
@@ -211,6 +228,8 @@ export async function runImportSync(): Promise<void> {
       await redis.set(RedisKey.importPhase(IMPORT_SOURCE), 'incremental')
     } else {
       await consumePendingPosts(assertLock, lockKey, owner)
+      // 对账旁路:补拉最近热门帖的新评论(游标漏掉的溢出楼层),见文件尾 reconcile 三函数
+      await reconcileRecentTopics(assertLock)
     }
   } finally {
     clearInterval(renewTimer)
@@ -220,7 +239,7 @@ export async function runImportSync(): Promise<void> {
   }
 }
 
-/** 消费 /posts.json 增量楼层并推进游标(新主题准入不在这里,见 processTopicCandidates) */
+/** 消费 /posts.json 增量楼层并推进游标(对账旁路见 reconcileRecentTopics) */
 async function consumePendingPosts(
   assertLock: () => void,
   lockKey: string,
@@ -519,6 +538,9 @@ async function appendComment(
       await importEarn(tx, authorId, PointType.COMMENT, comment.id, createdAt)
     }
   })
+
+  // 评论入账后:余额超阈值的影子用户按概率触发一次增量随机消费(占位账号豁免)
+  if (authorId !== placeholderId) await maybeIncrementalShopPurchase(authorId, assertLock)
 }
 
 
@@ -730,6 +752,52 @@ async function removeSynced(mappingId: number, assertLock: () => void): Promise<
 }
 
 /**
+ * 增量阶段的随机消费:影子用户余额超过阈值后,按概率随机触发一次商店购买。
+ *
+ * 复用 shop.service.buyDecoration(真实购买路径)而非像 fabricate 那样批量直写——
+ * 增量是零散事件、单笔购买,没有几十万笔重放的性能压力,走真实路径能让余额/流水/
+ * 佩戴槽/持有记录与线上真实购买完全同构(balanceAfter 链、points:audit 三不变量天然成立)。
+ *
+ * 只对影子用户生效(真实用户不替其造消费痕迹);余额 ≤ 阈值或抽签未中即静默返回。
+ * 买「买得起的最贵一件」,与 fabricateShopPurchases 的 orderBy price desc 取首个同口径。
+ */
+async function maybeIncrementalShopPurchase(userId: number, assertLock: () => void): Promise<void> {
+  assertLock()
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { isShadow: true, points: true },
+  })
+  if (!user?.isShadow) return
+  if (user.points <= INCREMENTAL_SHOP_PURCHASE_MIN_POINTS) return
+  if (Math.random() >= INCREMENTAL_SHOP_PURCHASE_PROB) return
+
+  const items = await prisma.shopItem.findMany({
+    where: {
+      isActive: true,
+      type: { in: [ShopItemType.TITLE, ShopItemType.USERNAME_COLOR] },
+      price: { lte: user.points },
+    },
+    orderBy: { price: 'desc' },
+    select: { id: true },
+    take: 1,
+  })
+  const itemId = items[0]?.id
+  if (!itemId) return
+
+  assertLock()
+  try {
+    await buyDecoration(userId, itemId)
+    console.log(`[import-sync] 增量随机消费:影子用户 #${userId} 购买装饰 item#${itemId}`)
+  } catch (err) {
+    // 余额竞态(理论上单 worker 串行不会发生)等只记日志,不打断同步主流程
+    console.warn(
+      `[import-sync] 增量随机消费失败(userId=${userId}, itemId=${itemId}):`,
+      (err as Error).message,
+    )
+  }
+}
+
+/**
  * 新导入主题的积分重放:一楼 post +10、每条评论 comment +3(占位账号豁免)。
  *
  * **幂等**:先查该帖/评论已有的 post/comment 类型流水,已发过的 refId 直接跳过。
@@ -770,20 +838,29 @@ async function replayTopicPoints(
   for (const l of logs) paid.add(`${l.type}:${l.userId}:${l.refId}`)
   assertLock()
 
+  const earnedBy = new Set<number>()
   await prisma.$transaction(
     async (tx) => {
       assertLock()
       if (post.authorId !== placeholderId && !paid.has(`${PointType.POST}:${post.authorId}:${post.id}`)) {
         await importEarn(tx, post.authorId, PointType.POST, post.id, post.createdAt)
+        earnedBy.add(post.authorId)
       }
       for (const c of comments) {
         if (c.authorId === placeholderId) continue
         if (paid.has(`${PointType.COMMENT}:${c.authorId}:${c.id}`)) continue
         await importEarn(tx, c.authorId, PointType.COMMENT, c.id, c.createdAt)
+        earnedBy.add(c.authorId)
       }
     },
     { timeout: 60_000 }, // 千楼大帖逐条 importEarn,放宽默认 5s 事务超时(与 importTopic 一致)
   )
+
+  // 本次新入账的影子用户,余额超阈值后按概率触发一次增量随机消费
+  for (const uid of earnedBy) {
+    assertLock()
+    await maybeIncrementalShopPurchase(uid, assertLock)
+  }
 }
 
 /** 写入/更新帖子搜索索引(派生数据,失败只记日志不影响同步) */
@@ -804,4 +881,162 @@ async function reindexPost(localPostId: number): Promise<void> {
   await indexPost(post).catch((err) => {
     console.error('[import-sync] 写入搜索索引失败:', err)
   })
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// 增量对账(reconcile):补拉最近热门帖的新评论的安全网旁路。
+//
+// 为什么要有它:/posts.json 只给全站最新 50 条楼层,评论高速涌入时新评论会被挤出
+// 窗口、游标直接跳过而永久丢失(consumePendingPosts 只告警不补)。对账另起一路:
+// 圈「最近 N 天创建 + 热度最高」的有限追踪池,周期性只读 diff、把 stream 里本地
+// 缺的楼层补进来。仅补新增,不做编辑/删除(那些仍由 /posts.json 游标负责)。
+// 判定(read)与副作用(write)分离:buildReconcilePool 纯只读导出给干跑脚本。
+// ──────────────────────────────────────────────────────────────────────
+
+/**
+ * 对账追踪池(**纯只读**,导出给干跑脚本):圈最近 RECONCILE_WINDOW_DAYS 天内创建的
+ * 导入帖,按热度(评论数优先、浏览数次之)降序截断到 RECONCILE_MAX_TOPICS。
+ *
+ * 为什么按热度截断:窗口内主题量不定,全量无差别轮询会白白烧源站 API 配额。热度是
+ * 「还会继续产生评论」的最佳代理,故只保最热的 N 条;冷门帖新评论仍由 /posts.json 兜底。
+ */
+export async function buildReconcilePool(
+  cutoff: Date,
+): Promise<{ localPostId: number; sourceTopicId: number }[]> {
+  // 1. 窗口内本地帖子(源站发帖时间 = Post.createdAt),带热度字段。走 @@index([createdAt])
+  const recentPosts = await prisma.post.findMany({
+    where: { createdAt: { gte: cutoff } },
+    select: { id: true, commentCount: true, viewCount: true },
+    orderBy: [{ commentCount: 'desc' }, { viewCount: 'desc' }, { id: 'asc' }],
+  })
+  if (recentPosts.length === 0) return []
+
+  // 2. 其中「有导入映射」的才是导入帖(Post 上无 isImported 列,靠 import_mappings 反查)。走 @@index([localPostId])
+  const mappings = await prisma.importMapping.findMany({
+    where: { source: IMPORT_SOURCE, localPostId: { in: recentPosts.map((p) => p.id) } },
+    select: { localPostId: true, sourceTopicId: true },
+  })
+  const topicByPostId = new Map<number, number>(
+    mappings.map((m) => [m.localPostId!, m.sourceTopicId]),
+  )
+
+  // 3. 按已排序的热度序过滤出导入帖,截断到 RECONCILE_MAX_TOPICS
+  const pool: { localPostId: number; sourceTopicId: number }[] = []
+  for (const p of recentPosts) {
+    const sourceTopicId = topicByPostId.get(p.id)
+    if (sourceTopicId != null) pool.push({ localPostId: p.id, sourceTopicId })
+    if (pool.length >= RECONCILE_MAX_TOPICS) break
+  }
+  return pool
+}
+
+/**
+ * 对账单个主题:补拉源站新出现的评论(仅补新增)。
+ *
+ * 先只读 diff(快路径:无缺口只花 1 次 /t/{id}.json 请求),发现缺口才补拉 raw 并逐条
+ * appendComment。返回本次新增评论条数(0 = 无变化或整体跳过)。
+ *
+ * ⚠️ 为何不复用 importTopic:它一楼已有映射就返回 skipped,无法增量补楼;这里只把
+ * stream 里本地缺的楼层喂给 appendComment(它已实现楼层串行化 + 计数 + 积分 + 幂等映射)。
+ */
+async function reconcileTopic(
+  sourceTopicId: number,
+  localPostId: number,
+  assertLock: () => void,
+): Promise<number> {
+  assertLock()
+  // 1. 拉主题详情(stream 全量楼层 id + 首批 20 楼 raw;必须 include_raw=1 才带正文)
+  const topic = await fetchNodelocJson<DiscourseTopicDetail>(`/t/${sourceTopicId}.json?include_raw=1`)
+  assertLock()
+  if (!topic || topic.has_read_permission_restriction) return 0
+  // 注意:不重查分类 —— 主题已导入说明分类早已通过校验;cursor 路径对「已知主题的新评论」同样不重查
+
+  // 2. 该主题已映射的源楼层 id 集合(走 @@index([source, sourceTopicId]))
+  const mapped = await prisma.importMapping.findMany({
+    where: { source: IMPORT_SOURCE, sourceTopicId },
+    select: { sourcePostId: true },
+  })
+  const have = new Set(mapped.map((m) => m.sourcePostId))
+
+  // 3. 缺口 = stream 里有、本地没映射;无缺口直接返回(快路径,未变化只花 1 次请求)
+  const stream = topic.post_stream.stream ?? []
+  const missing = stream.filter((id) => !have.has(id))
+  if (missing.length === 0) return 0
+
+  // 4. 补拉缺口楼层的 raw(首批 20 已带 raw 的跳过,其余按 post_ids[] 分批)。
+  //    刻意不复用 import-topic.fetchAllPosts(它全量拉整楼),批量大小复用 POSTS_BATCH_SIZE
+  const posts: DiscoursePost[] = [...topic.post_stream.posts]
+  const haveRaw = new Set(posts.map((p) => p.id))
+  const needFetch = missing.filter((id) => !haveRaw.has(id))
+  for (let i = 0; i < needFetch.length; i += POSTS_BATCH_SIZE) {
+    assertLock()
+    const batch = needFetch.slice(i, i + POSTS_BATCH_SIZE)
+    const qs = batch.map((id) => `post_ids[]=${id}`).join('&')
+    const res = await fetchNodelocJson<DiscoursePostsResponse>(
+      `/t/${sourceTopicId}/posts.json?${qs}&include_raw=1`,
+    )
+    assertLock()
+    if (res?.post_stream?.posts) posts.push(...res.post_stream.posts)
+  }
+
+  // 5. 按 stream 顺序(楼层号升序)逐条 appendComment —— reply_to_post_number < post_number 恒成立,
+  //    升序保证父评论先落库、resolveParentComment 能归位;楼中楼 parent 归一由 resolveParentComment 完成
+  const byId = new Map(posts.map((p) => [p.id, p]))
+  let added = 0
+  for (const id of missing) {
+    const p = byId.get(id)
+    // 与 appendComment/回填同口径:自删/隐藏/无正文的楼层跳过(不写映射,下轮对账会再次发现并跳过)
+    if (!p || p.user_deleted || p.hidden || !p.raw) continue
+    assertLock()
+    // 防御:详情接口楼层对象理论上带 topic_id,但 appendComment/resolveParentComment 都读它;
+    // 用已知的 sourceTopicId 归一,避免字段缺失时 resolveParentComment 查不到父而误判成顶层
+    const parentId = await resolveParentComment({ ...p, topic_id: sourceTopicId })
+    assertLock()
+    await appendComment({ ...p, topic_id: sourceTopicId }, localPostId, parentId, assertLock)
+    added += 1
+  }
+  if (added > 0) {
+    console.log(`[import-reconcile] topic#${sourceTopicId} 补 ${added} 条新评论`)
+  }
+  return added
+}
+
+/**
+ * 增量对账入口:每轮 tick 在 consumePendingPosts 之后调用,与游标同受一把 SETNX 锁。
+ *
+ * 追踪池按热度降序 + 环形轮转(游标 importReconcileOffset 存 Redis,跨实例/重启续跑),
+ * 单轮处理 RECONCILE_BATCH_SIZE 条、受 RECONCILE_BUDGET_MS 预算约束。单主题失败只记
+ * 日志、按「尝试数」推进游标 —— 下轮全环转一圈后自然重试(对账是安全网,失败不值得阻塞)。
+ */
+async function reconcileRecentTopics(assertLock: () => void): Promise<void> {
+  assertLock()
+  const cutoff = new Date(Date.now() - RECONCILE_WINDOW_DAYS * 24 * 3600 * 1000)
+  const pool = await buildReconcilePool(cutoff)
+  assertLock()
+  const n = pool.length
+  if (n === 0) return
+
+  const offsetKey = RedisKey.importReconcileOffset(IMPORT_SOURCE)
+  const rawOffset = await redis.get(offsetKey)
+  let offset = Number(rawOffset)
+  if (!rawOffset || !Number.isFinite(offset) || offset < 0) offset = 0
+  offset = offset % n // 防池缩小后越界
+
+  const budgetEnd = Date.now() + RECONCILE_BUDGET_MS
+  const processed = Math.min(RECONCILE_BATCH_SIZE, n)
+  let attempted = 0
+  for (let i = 0; i < processed && Date.now() < budgetEnd; i++) {
+    const t = pool[(offset + i) % n]
+    assertLock()
+    try {
+      await reconcileTopic(t.sourceTopicId, t.localPostId, assertLock)
+    } catch (err) {
+      if (err instanceof ImportLockLostError) throw err
+      console.error(`[import-reconcile] topic#${t.sourceTopicId} 对账失败:`, (err as Error).message)
+    }
+    attempted = i + 1
+  }
+
+  assertLock()
+  await redis.set(offsetKey, String((offset + attempted) % n))
 }

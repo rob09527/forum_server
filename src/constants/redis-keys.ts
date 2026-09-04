@@ -140,6 +140,11 @@ export const RedisKey = {
    * 替代旧脚本的文件断点 .import-backfill-checkpoint.json，随 worker 一起存 Redis。
    */
   importBackfillPage: (source: string) => `import:${source}:backfill-page` as const,
+  /**
+   * 增量对账轮转游标（STRING 数字）：下一个从追踪池第几个下标开始处理。
+   * 对账池按热度降序 + 环形轮转，此偏移跨 tick/跨实例共享，重启后从上次位置续跑。
+   */
+  importReconcileOffset: (source: string) => `import:${source}:reconcile-offset` as const,
 
   // ── 装饰 ──
   /** 装饰到期提醒的分布式锁（SET NX EX 60）。保证多实例只有一个扫描今日到期 [T2] */
