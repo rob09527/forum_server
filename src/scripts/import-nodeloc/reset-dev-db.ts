@@ -7,8 +7,11 @@ import { hashPassword } from '../../utils/password.js'
 import { deterministicLocalAvatar } from '../../utils/avatar.js'
 
 /**
- * NodeLoc 全量回填前的清库脚本(仅限本地 dev 库,交接文档阶段 2 前置步骤)。
- * 运行:pnpm tsx src/scripts/import-nodeloc/reset-dev-db.ts
+ * NodeLoc 全量回填前的清库脚本(dev 交互式 / 测试·生产非交互式两用)。
+ * 运行:
+ *   dev        pnpm tsx src/scripts/import-nodeloc/reset-dev-db.ts            (交互,输入库名确认)
+ *   测试/生产  node dist/scripts/import-nodeloc/reset-dev-db.js --yes --db=forum
+ *              (非交互,由 deploy/manage.sh 的 reset-import 子命令调用)
  *
  * 做三件事:
  * 1. TRUNCATE 业务内容表(RESTART IDENTITY CASCADE),**保留**:
@@ -16,12 +19,13 @@ import { deterministicLocalAvatar } from '../../utils/avatar.js'
  *    ⚠️ 永远不碰 admin 的 base_sys_* 表与 _prisma_migrations(共享库红线)
  * 2. 前缀删除 Redis 业务键(SCAN 非阻塞),**保留** config:*(admin 写的 6 组游戏化配置)
  *    与 admin 前缀(admin:* / verify:* / dict:*);禁止 FLUSHDB
- * 3. 重建 UI 测试账号 demo_user_ui(截图脚本依赖;注意 id 会变,不再是 73)
+ * 3. dev 下重建 UI 测试账号 demo_user_ui(截图脚本依赖;注意 id 会变,不再是 73)
  *    与清空 Meilisearch posts 索引(回填后统一 search:reindex)
  *
  * 双守卫(防误删生产):
- *   - NODE_ENV 必须为 development(dev .env 设 development;生产/测试 compose 设 production)
- *   - 非交互终端拒绝 + 要求完整输入目标库名确认(防 DATABASE_URL 误指到生产)
+ *   - 交互式(无 --yes):NODE_ENV 必须为 development,且要求完整输入目标库名确认
+ *   - 非交互(--yes):必须显式 --db=<库名> 且与 DATABASE_URL 解析出的库名一致,否则拒绝
+ *     这是测试/生产唯一的清库入口,双重核对(--yes + 库名)后再动手
  */
 
 /** 要清空的业务表(与 prisma schema @@map 一一对应;CASCADE 兜底漏列的外键) */
@@ -153,20 +157,42 @@ async function clearSearchIndex(): Promise<void> {
   }
 }
 
-const run = async () => {
-  // 守卫 1：仅限 development 环境（dev .env 设 development；生产/测试 compose 设 production）
-  if (config.NODE_ENV !== 'development') {
-    console.error(`[reset] ✗ 拒绝执行：NODE_ENV=${config.NODE_ENV}，本脚本仅限 development 环境。`)
-    console.error('    生产/测试库请人工核对后操作（本脚本仅限 dev 环境，勿用于其它库）。')
-    process.exit(1)
+/** 解析 CLI 参数：--yes（跳过交互确认）、--db=<name>（显式目标库名，与 DATABASE_URL 核对） */
+function parseArgs(argv: string[]): { yes: boolean; db?: string } {
+  const result: { yes: boolean; db?: string } = { yes: false }
+  for (const arg of argv) {
+    if (arg === '--yes') result.yes = true
+    else if (arg.startsWith('--db=')) result.db = arg.slice('--db='.length)
   }
-  // 守卫 2：非交互终端 + 输入目标库名（防 DATABASE_URL 误指到生产）
-  await confirmReset(dbNameFromUrl(config.DATABASE_URL))
+  return result
+}
 
-  console.log('[reset] 开始清理 dev 库(共享库红线:不触碰 base_sys_* / _prisma_migrations)')
+const run = async () => {
+  const { yes, db } = parseArgs(process.argv.slice(2))
+  const dbName = dbNameFromUrl(config.DATABASE_URL)
+
+  if (yes) {
+    // 非交互清库（--yes）：必须显式 --db 且与 DATABASE_URL 库名一致，双重核对后直接动手
+    if (!db || db !== dbName) {
+      console.error(`[reset] ✗ --yes 需同时给 --db=<库名> 且与 DATABASE_URL 一致（当前库：${dbName}）。`)
+      console.error('    测试/生产请走 deploy/manage.sh reset-import（内部已带 --yes --db=forum）。')
+      process.exit(1)
+    }
+    console.log(`[reset] 非交互清库：目标库 ${dbName}（--yes 已确认），NODE_ENV=${config.NODE_ENV}`)
+  } else {
+    // 交互清库：仅限 development 环境 + 输入完整库名确认（防 DATABASE_URL 误指生产）
+    if (config.NODE_ENV !== 'development') {
+      console.error(`[reset] ✗ 拒绝执行：NODE_ENV=${config.NODE_ENV}，交互清库仅限 development 环境。`)
+      console.error('    测试/生产请用 deploy/manage.sh reset-import（内部走 --yes --db=forum）。')
+      process.exit(1)
+    }
+    await confirmReset(dbName)
+  }
+
+  console.log('[reset] 开始清理(共享库红线:不触碰 base_sys_* / _prisma_migrations)')
   await truncateTables()
   await cleanRedis()
-  await recreateDemoUser()
+  if (config.NODE_ENV === 'development') await recreateDemoUser()
   await clearSearchIndex()
   console.log('[reset] 完成')
 }

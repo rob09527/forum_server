@@ -49,8 +49,8 @@ const envSchema = z.object({
 
   /**
    * NodeLoc 数据同步 worker 开关，默认开启。
-   * true = 启用 worker：/posts.json 增量轮询，自动把 NodeLoc 最新内容同步回本库。
-   * 空库不回灌、不造数（历史数据需手动回灌：显式写 Redis import:nodeloc:phase=backfill）。
+   * true = 启用 worker：冷启动自动完成「全量回灌 → 造数 → 增量」三阶段，
+   * 之后进入 /posts.json 增量轮询，自动把 NodeLoc 最新内容同步回本库。
    */
   IMPORT_SYNC_ENABLED: z
     .string()
