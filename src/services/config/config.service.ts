@@ -474,13 +474,40 @@ export async function getLimitsConfig(): Promise<LimitsConfig> {
 }
 
 /**
+ * ── NodeLoc 导入同步配置（第 8 组）──
+ * worker 启停开关：把原先只能靠环境变量 + 重启生效的 IMPORT_SYNC_ENABLED 抽成可热切换的配置组。
+ * env 继续作为默认值（后台未配置时行为与改动前一致），后台写 config:nodeloc 后即时覆盖、无需重启。
+ * index.ts 的 60s 调度器每轮读本组（带进程内缓存 + 跨实例失效），点开关后下一个 tick 即生效。
+ */
+
+/** NodeLoc 导入同步配置 */
+export interface NodelocConfig {
+  /** 同步 worker 开关：true 时 60s 调度器才跑 runImportSync（回灌→造数→增量），false 暂停 */
+  syncEnabled: boolean
+}
+
+/** 默认 NodeLoc 导入同步配置：syncEnabled 以环境变量 IMPORT_SYNC_ENABLED 为默认值（同 limits 组 env 兜底模式） */
+export const DEFAULT_NODELOC_CONFIG: NodelocConfig = {
+  syncEnabled: config.IMPORT_SYNC_ENABLED,
+}
+
+const nodelocConfigSchema = z.object({
+  syncEnabled: z.boolean(),
+})
+
+/** 读取 NodeLoc 导入同步配置，Redis 缺失/非法/异常一律返回默认值 */
+export async function getNodelocConfig(): Promise<NodelocConfig> {
+  return readGroup(RedisKey.configNodeloc, nodelocConfigSchema, DEFAULT_NODELOC_CONFIG)
+}
+
+/**
  * ── 配置写入口（服务端单一 owner，admin 改走 HTTP 转发）──
  * 配置契约（Redis key 名 + zod schema + 默认值）只此一份，杜绝 admin 手抄漂移。
  * admin 后端不再直连 Redis，统一经 /api/admin/config 读写。
  */
 
 /** 配置组标识 */
-export type ConfigGroup = 'checkin' | 'levels' | 'shop' | 'tip' | 'bounty' | 'props' | 'limits'
+export type ConfigGroup = 'checkin' | 'levels' | 'shop' | 'tip' | 'bounty' | 'props' | 'limits' | 'nodeloc'
 
 /** 组 → { Redis key, 校验 schema, 读取函数 }，set/get/reset 统一分发 */
 const CONFIG_GROUPS = {
@@ -491,6 +518,7 @@ const CONFIG_GROUPS = {
   bounty: { key: RedisKey.configBounty, schema: bountyConfigSchema, get: getBountyConfig },
   props: { key: RedisKey.configProps, schema: propsConfigSchema, get: getPropsConfig },
   limits: { key: RedisKey.configLimits, schema: limitsConfigSchema, get: getLimitsConfig },
+  nodeloc: { key: RedisKey.configNodeloc, schema: nodelocConfigSchema, get: getNodelocConfig },
 } as const satisfies Record<ConfigGroup, { key: string; schema: z.ZodTypeAny; get: () => Promise<unknown> }>
 
 /**
@@ -503,7 +531,7 @@ export const CONFIG_GROUP_NAMES = Object.keys(CONFIG_GROUPS) as [ConfigGroup, ..
 
 /** 全部配置组的已解析生效值 + 等级预置池（zod 校验 + 默认兜底后的真实值，admin 表单据此初始化） */
 export async function getAllConfigs() {
-  const [checkin, levels, shop, tip, bounty, props, limits] = await Promise.all([
+  const [checkin, levels, shop, tip, bounty, props, limits, nodeloc] = await Promise.all([
     getCheckinConfig(),
     getLevels(),
     getShopConfig(),
@@ -511,8 +539,9 @@ export async function getAllConfigs() {
     getBountyConfig(),
     getPropsConfig(),
     getLimitsConfig(),
+    getNodelocConfig(),
   ])
-  return { checkin, levels, shop, tip, bounty, props, limits, levelPool: LEVEL_POOL }
+  return { checkin, levels, shop, tip, bounty, props, limits, nodeloc, levelPool: LEVEL_POOL }
 }
 
 /**

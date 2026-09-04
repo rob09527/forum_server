@@ -105,6 +105,11 @@ export const RedisKey = {
    */
   configLimits: 'config:limits',
   /**
+   * NodeLoc 导入同步配置（JSON 字符串），第 8 组。worker 启停开关热切换。
+   * 未配置/非法时用 config.service 的 DEFAULT_NODELOC_CONFIG（其 syncEnabled 以环境变量 IMPORT_SYNC_ENABLED 为默认值）。
+   */
+  configNodeloc: 'config:nodeloc',
+  /**
    * 配置失效广播频道（pub/sub）。message 为该组的 Redis key（如 `config:limits`）或 `*`（全部失效）。
    *
    * 为什么需要它:配置读取带进程内缓存（见 services/config/config-cache.ts），

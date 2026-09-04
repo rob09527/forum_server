@@ -24,6 +24,7 @@ import { uploadRoutes } from './routes/upload.routes.js'
 import { checkinRoutes } from './routes/checkin.routes.js'
 import { userRoutes } from './routes/user.routes.js'
 import { adminRoutes } from './routes/admin.routes.js'
+import { nodelocAdminRoutes } from './routes/nodeloc-admin.routes.js'
 import { searchRoutes } from './routes/search.routes.js'
 import { configRoutes } from './routes/config.routes.js'
 import { notificationRoutes } from './routes/notification.routes.js'
@@ -180,6 +181,7 @@ await fastify.register(uploadRoutes)
 await fastify.register(checkinRoutes)
 await fastify.register(userRoutes)
 await fastify.register(adminRoutes)
+await fastify.register(nodelocAdminRoutes)
 await fastify.register(searchRoutes)
 await fastify.register(configRoutes)
 await fastify.register(notificationRoutes)

@@ -4,6 +4,7 @@ import { ensurePostsIndex } from './lib/meilisearch.js'
 import { checkAndNotifyExpired } from './services/shop/decoration-remind.js'
 import { sweepExpiredBounties } from './services/bounty/bounty-sweep.js'
 import { runImportSync } from './services/import/import-sync.service.js'
+import { getNodelocConfig } from './services/config/config.service.js'
 import { sweepPendingAvatars } from './services/upload/upload.service.js'
 
 // 确保 Meili 帖子索引存在并应用设置（幂等）。不阻塞启动——搜索是派生能力，
@@ -21,8 +22,9 @@ setInterval(async () => {
   await runScheduled('bounty-sweep', sweepExpiredBounties)
   await runScheduled('decoration-remind', checkAndNotifyExpired)
   await runScheduled('pending-avatar-sweep', sweepPendingAvatars)
-  // NodeLoc 增量同步：默认关闭；开启后由 Redis 锁 TTL 降频到实际 120s 一轮
-  if (config.IMPORT_SYNC_ENABLED) {
+  // NodeLoc 增量同步：热切换开关（config:nodeloc，env 兜底），开启后由 Redis 锁 TTL 降频到实际 120s 一轮
+  const { syncEnabled } = await getNodelocConfig()
+  if (syncEnabled) {
     await runScheduled('import-sync', runImportSync)
   }
 }, SCHEDULE_INTERVAL_MS)
