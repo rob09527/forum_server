@@ -3,6 +3,15 @@ import { redis } from '../../lib/redis.js'
 import { RedisKey } from '../../constants/redis-keys.js'
 import { UserLevel } from '../../constants/business.js'
 import { ValidationError } from '../../utils/errors.js'
+import { config } from '../../config.js'
+import {
+  getCachedConfig,
+  setCachedConfig,
+  invalidateCachedConfig,
+  publishConfigInvalidation,
+  getInFlightConfig,
+  setInFlightConfig,
+} from './config-cache.js'
 
 /**
  * 游戏化配置服务（签到奖励 / 等级体系）。
@@ -14,6 +23,9 @@ import { ValidationError } from '../../utils/errors.js'
  *
  * 默认值即原硬编码规则（docs/积分签到等级体系.md 是唯一规则来源），
  * 未配置时行为与改动前完全一致。
+ *
+ * **读取带进程内缓存**（config-cache.ts），跨实例失效走 Redis pub/sub + 软 TTL 兜底 ——
+ * 为什么必须跨实例、为什么 pub/sub 还要配 TTL，见 config-cache.ts 顶部注释。
  */
 
 /** 签到奖励配置 [R10][R11][R12] */
@@ -124,32 +136,57 @@ const levelsSchema = z
   })
 
 /**
- * 从 Redis 读 JSON 配置，解析 + 校验，任一环节失败返回 undefined（调用方兜底）。
- * Redis 异常也在此吞掉（log 警告），保证核心路径不被配置读取拖垮。
+ * 读一组配置：进程内缓存 → Redis → JSON 解析 → zod 校验 → 默认兜底。
+ * 命中缓存时零 Redis 往返、零 zod 解析（缓存里存的就是最终生效值）。
+ *
+ * ⚠️ **校验失败必须打日志，不能静默兜底**。原先 6 组都是 `if (!parsed.success) return DEFAULT_*`，
+ * `config:levels` 曾因此吃过亏：admin 存进一份不合 schema 的等级表，forum 侧整体回退默认值，
+ * 界面上「配置明明保存成功了却不生效」，日志里一个字都没有，只能靠读代码猜。
+ * 所以这里区分两种情况：
+ * - Redis 里**没有这个 key**（未配置）：正常状态，静默用默认值，不刷日志；
+ * - Redis 里**有值但解析/校验不过**（脏数据）：`console.error` 打出具体 issue 路径。
+ *
+ * Redis 异常同样吞掉（warn），保证配置读取不拖垮签到/发帖/限流等核心路径；
+ * 此时也会把默认值写进缓存，避免 Redis 挂掉时每请求都去重试连接（最坏滞后 = 软 TTL）。
+ *
+ * @param key 配置组的 Redis key
+ * @param schema 该组的 zod schema
+ * @param fallback 该组的代码内置默认值
  */
-async function readConfigJson(key: string): Promise<unknown | undefined> {
-  try {
-    const raw = await redis.get(key)
-    if (!raw) return undefined
-    return JSON.parse(raw)
-  } catch (err) {
-    console.warn(`[config] 读取 ${key} 失败，使用默认值兜底:`, (err as Error).message)
-    return undefined
-  }
+async function readGroup<T>(key: string, schema: z.ZodType<T>, fallback: T): Promise<T> {
+  const cached = getCachedConfig<T>(key)
+  if (cached !== undefined) return cached
+  const pending = getInFlightConfig<T>(key)
+  if (pending) return pending
+
+  return setInFlightConfig(key, (async () => {
+    let value = fallback
+    try {
+      const raw = await redis.get(key)
+      if (raw) {
+        const parsed = schema.safeParse(JSON.parse(raw))
+        if (parsed.success) value = parsed.data
+        else {
+          const detail = parsed.error.issues.map((i) => `${i.path.join('.') || '值'} ${i.message}`).join('；')
+          console.error(`[config] ${key} 内容非法，已回退默认值（后台的修改不会生效）：${detail}`)
+        }
+      }
+    } catch (err) {
+      console.warn(`[config] 读取 ${key} 失败，使用默认值兜底:`, (err as Error).message)
+    }
+    setCachedConfig(key, value)
+    return value
+  })())
 }
 
 /** 读取签到配置，Redis 缺失/非法/异常一律返回默认值 */
 export async function getCheckinConfig(): Promise<CheckinConfig> {
-  const parsed = checkinConfigSchema.safeParse(await readConfigJson(RedisKey.configCheckin))
-  if (!parsed.success) return DEFAULT_CHECKIN_CONFIG
-  return parsed.data
+  return readGroup(RedisKey.configCheckin, checkinConfigSchema, DEFAULT_CHECKIN_CONFIG)
 }
 
 /** 读取等级配置，Redis 缺失/非法/异常一律返回默认值 */
 export async function getLevels(): Promise<LevelConfig[]> {
-  const parsed = levelsSchema.safeParse(await readConfigJson(RedisKey.configLevels))
-  if (!parsed.success) return DEFAULT_LEVELS
-  return parsed.data
+  return readGroup(RedisKey.configLevels, levelsSchema, DEFAULT_LEVELS)
 }
 
 /**
@@ -292,30 +329,135 @@ const propsConfigSchema = z.object({
 
 /** 读取商城配置，Redis 缺失/非法/异常一律返回默认值 */
 export async function getShopConfig(): Promise<ShopConfig> {
-  const parsed = shopConfigSchema.safeParse(await readConfigJson(RedisKey.configShop))
-  if (!parsed.success) return DEFAULT_SHOP_CONFIG
-  return parsed.data
+  return readGroup(RedisKey.configShop, shopConfigSchema, DEFAULT_SHOP_CONFIG)
 }
 
 /** 读取打赏配置，Redis 缺失/非法/异常一律返回默认值 */
 export async function getTipConfig(): Promise<TipConfig> {
-  const parsed = tipConfigSchema.safeParse(await readConfigJson(RedisKey.configTip))
-  if (!parsed.success) return DEFAULT_TIP_CONFIG
-  return parsed.data
+  return readGroup(RedisKey.configTip, tipConfigSchema, DEFAULT_TIP_CONFIG)
 }
 
 /** 读取悬赏配置，Redis 缺失/非法/异常一律返回默认值 */
 export async function getBountyConfig(): Promise<BountyConfig> {
-  const parsed = bountyConfigSchema.safeParse(await readConfigJson(RedisKey.configBounty))
-  if (!parsed.success) return DEFAULT_BOUNTY_CONFIG
-  return parsed.data
+  return readGroup(RedisKey.configBounty, bountyConfigSchema, DEFAULT_BOUNTY_CONFIG)
 }
 
 /** 读取道具配置，Redis 缺失/非法/异常一律返回默认值 */
 export async function getPropsConfig(): Promise<PropsConfig> {
-  const parsed = propsConfigSchema.safeParse(await readConfigJson(RedisKey.configProps))
-  if (!parsed.success) return DEFAULT_PROPS_CONFIG
-  return parsed.data
+  return readGroup(RedisKey.configProps, propsConfigSchema, DEFAULT_PROPS_CONFIG)
+}
+
+/**
+ * ── 频率/体积限制配置（第 7 组，交接快照 §11.7）──
+ * 收拢原先散落三处的限流与体积上限：
+ * 1. 环境变量（`config.ts` 的 `UPLOAD_MAX_*`）→ 本组的 `upload*` 三项，**环境变量继续作为默认值**，
+ *    未在后台配置时行为与改动前完全一致，也不会把运维已调过的 env 值悄悄丢掉；
+ * 2. `app.ts` 硬编码（全局 600 次/分/IP、multipart fileSize）→ `apiRatePerMinute` / `uploadMaxFileSize`；
+ * 3. `message.service.ts` 模块常量（私信 2000 字、30 条/分）→ `dm*` 两项。
+ *
+ * **积分每日上限（发帖 3 次/日、评论 10 次/日）本轮不纳入**：它已经有自己的归属
+ * （`points.service.ts` 的积分规则体系），搬过来会和积分账本的记账口径纠缠，收益不抵风险。
+ */
+
+/** 频率/体积限制配置 [§11.7] */
+export interface LimitsConfig {
+  /** 单文件上传体积上限（字节）。默认取环境变量 `UPLOAD_MAX_FILE_SIZE`（10MB） */
+  uploadMaxFileSize: number
+  /** 单用户上传总配额（字节）。默认取环境变量 `UPLOAD_MAX_USER_TOTAL_SIZE`（50MB） */
+  uploadMaxUserTotalSize: number
+  /** 单用户上传次数上限（次/分钟）。默认取环境变量 `UPLOAD_MAX_UPLOADS_PER_MINUTE`（20） */
+  uploadMaxPerMinute: number
+  /** 接口请求上限（次/分钟/IP），对应限流 `api` 桶（原 `app.ts` 硬编码的 600） */
+  apiRatePerMinute: number
+  /** 头像图片拉取上限（次/分钟/IP），对应限流 `avatar` 桶（`/uploads/avatars/*`）。默认值推导见 DEFAULT_LIMITS_CONFIG */
+  avatarFetchPerMinute: number
+  /** 其余图片拉取上限（次/分钟/IP），对应限流 `image` 桶（`/uploads/*` 中的正文图/素材） */
+  imageFetchPerMinute: number
+  /** 单条私信正文最大字符数 */
+  dmContentMaxLength: number
+  /** 单用户私信发送上限（条/分钟） */
+  dmMaxPerMinute: number
+}
+
+/**
+ * 默认限制配置。上传三项以环境变量为默认值（见 LimitsConfig 注释），其余为原硬编码值。
+ *
+ * ## 头像桶 4800 次/分/IP 是怎么算出来的（不是拍的）
+ * 目标是「正常操作的人永远打不到」，所以按**最坏的正常行为**算，再留倍数余量：
+ * - 一个列表页最多约 50 个头像（帖子作者 + 最后回复者）→ **50 张/页**；
+ * - 人手动翻页的可持续上限约 2 秒一页 → **30 页/分钟**；
+ *   50 × 30 = **1500**；
+ * - ×2:SSR 与客户端水合可能各请求一轮，加上快速前进/后退的重复拉取 → **3000**；
+ * - ×1.6:办公室/校园/运营商 CGNAT 共用出口 IP，同一 IP 后面可能坐着若干人 → **4800**。
+ *
+ * 还有一条**必须**算进来的放大因子：`@fastify/static` 默认发 `Cache-Control: public, max-age=0`，
+ * 浏览器每次都会带 `If-None-Match` 回来验证，而 **304 也照样计入限流计数**。
+ * 也就是说「第二次访问首页」不会因为命中缓存就不占配额，余量必须按这个前提留。
+ *
+ * ## 图片桶 1200 次/分/IP
+ * 一篇正文里图片约 20 张，连续翻帖约 15 篇/分钟 → 300；×2 余量 → 600；×1.6 共用出口 → 960，取整 **1200**。
+ * 比头像桶低一个量级是刻意的：正文图才是真正可能被当图床刷的那类资源。
+ *
+ * ## 为什么 api 桶仍是 600
+ * 保持原行为不变。把 `/uploads/*` 从这个桶里拆出去，本身就是 §8.7 第 3 项的修复
+ * （头像把接口配额吃光 → 首页空列表 + 头像批量裂图），不需要再动 600 这个数。
+ */
+export const DEFAULT_LIMITS_CONFIG: LimitsConfig = {
+  uploadMaxFileSize: config.UPLOAD_MAX_FILE_SIZE,
+  uploadMaxUserTotalSize: config.UPLOAD_MAX_USER_TOTAL_SIZE,
+  uploadMaxPerMinute: config.UPLOAD_MAX_UPLOADS_PER_MINUTE,
+  apiRatePerMinute: 600,
+  avatarFetchPerMinute: 4800,
+  imageFetchPerMinute: 1200,
+  dmContentMaxLength: 2000,
+  dmMaxPerMinute: 30,
+}
+
+/** 1 MB 的字节数，仅用于下方上下界表达 */
+const MB = 1024 * 1024
+
+/**
+ * 限制配置 schema。**每项都有上下界**：
+ * 下界防「填 0 把站点锁死」（限流填 0 = 所有请求 429），
+ * 上界防「填个天文数字等于没限制」，以及 `uploadMaxFileSize` 填太大直接变成内存 DoS 面。
+ */
+const limitsConfigSchema = z
+  .object({
+    uploadMaxFileSize: z.number().int().min(MB, '单文件上限不能小于 1MB').max(100 * MB, '单文件上限不能超过 100MB'),
+    uploadMaxUserTotalSize: z
+      .number()
+      .int()
+      .min(10 * MB, '用户总配额不能小于 10MB')
+      .max(10 * 1024 * MB, '用户总配额不能超过 10GB'),
+    uploadMaxPerMinute: z.number().int().min(1).max(600),
+    apiRatePerMinute: z.number().int().min(30, '接口限流不能低于 30 次/分（会锁死正常浏览）').max(100_000),
+    avatarFetchPerMinute: z.number().int().min(60, '头像限流不能低于 60 次/分（一屏就打满）').max(200_000),
+    imageFetchPerMinute: z.number().int().min(30).max(100_000),
+    dmContentMaxLength: z.number().int().min(1).max(20_000),
+    dmMaxPerMinute: z.number().int().min(1).max(600),
+  })
+  .superRefine((limits, ctx) => {
+    // 总配额小于单文件上限时，用户连一个满额文件都传不进去，属于配置自相矛盾
+    if (limits.uploadMaxUserTotalSize < limits.uploadMaxFileSize) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['uploadMaxUserTotalSize'],
+        message: '用户总配额不能小于单文件上限',
+      })
+    }
+    // 头像桶配额低于图片桶时，分桶就失去意义（头像才是一屏几十张的那类）
+    if (limits.avatarFetchPerMinute < limits.imageFetchPerMinute) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['avatarFetchPerMinute'],
+        message: '头像拉取上限不应低于普通图片上限（头像是一屏几十张的资源）',
+      })
+    }
+  })
+
+/** 读取限制配置，Redis 缺失/非法/异常一律返回默认值（带进程内缓存，供每请求级的限流函数调用） */
+export async function getLimitsConfig(): Promise<LimitsConfig> {
+  return readGroup(RedisKey.configLimits, limitsConfigSchema, DEFAULT_LIMITS_CONFIG)
 }
 
 /**
@@ -325,7 +467,7 @@ export async function getPropsConfig(): Promise<PropsConfig> {
  */
 
 /** 配置组标识 */
-export type ConfigGroup = 'checkin' | 'levels' | 'shop' | 'tip' | 'bounty' | 'props'
+export type ConfigGroup = 'checkin' | 'levels' | 'shop' | 'tip' | 'bounty' | 'props' | 'limits'
 
 /** 组 → { Redis key, 校验 schema, 读取函数 }，set/get/reset 统一分发 */
 const CONFIG_GROUPS = {
@@ -335,22 +477,37 @@ const CONFIG_GROUPS = {
   tip: { key: RedisKey.configTip, schema: tipConfigSchema, get: getTipConfig },
   bounty: { key: RedisKey.configBounty, schema: bountyConfigSchema, get: getBountyConfig },
   props: { key: RedisKey.configProps, schema: propsConfigSchema, get: getPropsConfig },
+  limits: { key: RedisKey.configLimits, schema: limitsConfigSchema, get: getLimitsConfig },
 } as const satisfies Record<ConfigGroup, { key: string; schema: z.ZodTypeAny; get: () => Promise<unknown> }>
 
-/** 6 组配置的已解析生效值 + 等级预置池（zod 校验 + 默认兜底后的真实值，admin 表单据此初始化） */
+/**
+ * 全部合法配置组名。
+ * 路由层的 params 枚举必须引用这里，别再手抄一份数组
+ * —— 之前 admin.routes.ts 抄了两份（PUT/DELETE 各一），新增第 7 组时两处都会漏，
+ * 表现为「保存返回 400 不支持的配置组」而代码里明明注册了。
+ */
+export const CONFIG_GROUP_NAMES = Object.keys(CONFIG_GROUPS) as [ConfigGroup, ...ConfigGroup[]]
+
+/** 全部配置组的已解析生效值 + 等级预置池（zod 校验 + 默认兜底后的真实值，admin 表单据此初始化） */
 export async function getAllConfigs() {
-  const [checkin, levels, shop, tip, bounty, props] = await Promise.all([
+  const [checkin, levels, shop, tip, bounty, props, limits] = await Promise.all([
     getCheckinConfig(),
     getLevels(),
     getShopConfig(),
     getTipConfig(),
     getBountyConfig(),
     getPropsConfig(),
+    getLimitsConfig(),
   ])
-  return { checkin, levels, shop, tip, bounty, props, levelPool: LEVEL_POOL }
+  return { checkin, levels, shop, tip, bounty, props, limits, levelPool: LEVEL_POOL }
 }
 
-/** 写入一组配置：先 zod 校验再落 Redis，非法值直接抛 400，不写脏数据 */
+/**
+ * 写入一组配置：先 zod 校验再落 Redis，非法值直接抛 400，不写脏数据。
+ * 落库后**同步清本进程缓存 + 广播失效**：
+ * 同步清是因为调用方（admin.routes.ts）紧接着就会重新读配置（如 levels 的 recomputeLevels），
+ * 不能等 pub/sub 回环；广播是给其它实例用的，理由见 config-cache.ts。
+ */
 export async function setConfig(group: ConfigGroup, value: unknown): Promise<void> {
   const entry = CONFIG_GROUPS[group]
   if (!entry) throw new ValidationError('不支持的配置组')
@@ -360,11 +517,15 @@ export async function setConfig(group: ConfigGroup, value: unknown): Promise<voi
     throw new ValidationError(`配置「${group}」校验失败：${detail}`)
   }
   await redis.set(entry.key, JSON.stringify(parsed.data))
+  invalidateCachedConfig(entry.key)
+  await publishConfigInvalidation(entry.key)
 }
 
-/** 删除一组配置：forum 侧自动回退代码内置默认值 */
+/** 删除一组配置：forum 侧自动回退代码内置默认值（同样需要清缓存 + 广播，否则旧值会继续生效） */
 export async function resetConfig(group: ConfigGroup): Promise<void> {
   const entry = CONFIG_GROUPS[group]
   if (!entry) throw new ValidationError('不支持的配置组')
   await redis.del(entry.key)
+  invalidateCachedConfig(entry.key)
+  await publishConfigInvalidation(entry.key)
 }

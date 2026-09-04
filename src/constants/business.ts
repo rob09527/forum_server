@@ -201,6 +201,32 @@ export type AvatarStyleType = (typeof ALLOWED_AVATAR_STYLES)[number]
 /** 每个风格的本地预置头像数量（avatar-01.svg ~ avatar-20.svg） */
 export const AVATARS_PER_STYLE = 20
 
+/**
+ * 自定义上传头像的**服务端**强制限制（docs 交接快照 §9.2 / §13.1）。
+ *
+ * 为什么单独一组、而不是复用 config.UPLOAD_MAX_FILE_SIZE：
+ * 全局上传上限默认 10MB 是给正文配图的，对头像过大（头像会在列表页一屏几十次并发取图）。
+ * 头像必须有更小的独立上限 + 服务端等比压缩，**且校验只能在服务端做** ——
+ * 前端 crop 再上传是体验优化，绕过前端直接 POST 就失效了。
+ *
+ * ⚠️ 这里是**默认值**。运营可改值将由 `config:limits`（§11.7 配置中枢）覆盖，
+ * 中枢接入由持有 `config.service.ts` 的窗口负责；本常量始终是兜底默认。
+ */
+export const AVATAR_UPLOAD_LIMITS = {
+  /**
+   * 单张自定义头像的最大原始字节数。
+   * 单位：字节；默认 2MB（2 * 1024 * 1024 = 2097152）。
+   * 超过直接拒绝（ValidationError，人话提示），不做「先收下再压缩」。
+   */
+  maxFileSizeBytes: 2 * 1024 * 1024,
+  /**
+   * 头像的最大像素边长（宽、高各自的上限）。
+   * 单位：像素；默认 512。超过则**服务端等比缩放**到边长 ≤ 该值（不放大小图），
+   * 不是拒绝 —— 用户拍的照片普遍远大于 512，拒绝体验太差。
+   */
+  maxEdgePx: 512,
+} as const
+
 /** 公告类型（前台公告栏圆点颜色按此分类） */
 export const AnnouncementType = {
   /** 普通 */
@@ -266,14 +292,16 @@ export const SystemNotifyTarget = {
 } as const
 export type SystemNotifyTargetType = (typeof SystemNotifyTarget)[keyof typeof SystemNotifyTarget]
 
-/** 装饰商品类型。同类互相覆盖（单槽）、不同类共存 [1.3.3] */
+/**
+ * 装饰商品类型。同类互相覆盖（单槽）、不同类共存 [1.3.3]。
+ * ⚠️ 历史上还有 avatar(头像)，已于 §9.1 下线：头像不再是付费商品（预置模板任选 + 自定义上传，均免费），
+ * 枚举项一并删除 —— 留着会让后续维护者以为还存在付费头像链路。库里 360 行 type='avatar' 的商品行做软下架保留。
+ */
 export const ShopItemType = {
   /** 用户名颜色（CSS 色值/渐变） */
   USERNAME_COLOR: 'username_color',
   /** 专属称号（文本 + 徽章配色 key） */
   TITLE: 'title',
-  /** 头像（renderValue = /avatars/{style}/avatar-{nn}.svg，付费租用覆盖基础头像） */
-  AVATAR: 'avatar',
 } as const
 export type ShopItemTypeType = (typeof ShopItemType)[keyof typeof ShopItemType]
 

@@ -120,8 +120,15 @@ export async function userRoutes(fastify: FastifyInstance): Promise<void> {
 
   /**
    * PUT /api/user/me/avatar
-   * 更新当前用户的头像为本地预置头像（需登录）。
-   * Body: { avatar: string }，如 /avatars/bottts-neutral/avatar-03.svg
+   * 更新当前用户的头像（需登录）。头像来源两条、**都免费**（商城头像已于 §9.1 下线）：
+   * 1. 本地预置模板，如 `/avatars/bottts-neutral/avatar-03.svg`；
+   * 2. 用户自定义上传，如 `/uploads/avatars/a1b2c3.webp` —— 两步：
+   *    先 `POST /api/upload?partition=avatars` 拿到相对路径，再把该路径提交到本接口落库。
+   *    ⛔ `partition=avatars` 不能省：缺省是 `posts` 分区（且带日期子目录），
+   *    落到 posts 的路径会被本接口的头像白名单拒掉。
+   *
+   * Body: { avatar: string }。合法性由 service 层 assertAllowedAvatarPath 的白名单二选一判定
+   * （⛔ 不接受任意字符串/外链），自定义上传另在服务端强制体积与边长上限。
    */
   fastify.put('/api/user/me/avatar', {
     preHandler: [authenticate],

@@ -56,9 +56,20 @@ export const ErrorCode = {
   ITEM_NOT_FOUND: 'ITEM_NOT_FOUND',
   /** 商品已下架 */
   ITEM_NOT_ACTIVE: 'ITEM_NOT_ACTIVE',
-  /** 该头像需在商城购买解锁（付费头像未持有） */
+  /**
+   * @deprecated 商城头像模块已下架（§9.1）：抛出它的那条付费分支（updateAvatar 里查 UserDecoration
+   * 判持有）已删除,服务端已无任何抛出点。**保留仅为对外契约兼容**,理由同 AVATAR_FREE_PURCHASE。
+   * ⛔ 新代码不得使用。
+   * 原语义：该头像需在商城购买解锁（付费头像未持有）。
+   */
   AVATAR_LOCKED: 'AVATAR_LOCKED',
-  /** 免费池头像不可购买（永久有效，直接在个人资料选择） */
+  IMPORT_LOCK_LOST: 'IMPORT_LOCK_LOST',
+  /**
+   * @deprecated 商城头像模块已下架（§9.1）：头像不再是付费商品（预置模板任选 + 自定义上传，均免费），
+   * 服务端已无任何代码抛出该码。**保留仅为对外契约兼容** —— 错误码是契约，前端/后台可能已在分支里
+   * 判过它，静默删除等于行为变更。⛔ 新代码不得使用。
+   * 原语义：免费池头像不可购买（永久有效，直接在个人资料选择）。
+   */
   AVATAR_FREE_PURCHASE: 'AVATAR_FREE_PURCHASE',
 
   // ── 打赏 ──

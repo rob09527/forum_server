@@ -6,8 +6,7 @@ import { OAuthProvider, UserStatus } from '../../constants/business.js'
 import type { UserStatusType } from '../../constants/business.js'
 import { ConflictError, ForbiddenError, InvalidCredentialsError, UnauthorizedError } from '../../utils/errors.js'
 import { hashPassword, verifyPassword } from '../../utils/password.js'
-import { deterministicLocalAvatar, effectiveAvatar } from '../../utils/avatar.js'
-import { pickRandomFreeAvatar } from '../shop/shop.service.js'
+import { deterministicLocalAvatar } from '../../utils/avatar.js'
 import { generateToken } from './auth-token.service.js'
 import { prisma } from '../../lib/prisma.js'
 
@@ -101,8 +100,8 @@ function toPublic(user: {
     id: user.id,
     username: user.username,
     email: user.email,
-    // 头像折叠：租用头像未过期优先，否则基础头像（双槽对前端透明）
-    avatar: effectiveAvatar(user.avatar, user.decorAvatarValue, user.decorAvatarExpireAt),
+    // 头像单槽：租用头像覆盖层已随头像商城下线（§9.1），直接读基础头像
+    avatar: user.avatar,
     bio: user.bio,
     level: user.level,
     points: user.points,
@@ -149,8 +148,9 @@ export async function register(input: {
       username,
       email,
       passwordHash,
-      // 注册从免费头像池随机分配一个（头像商品化）；池为空（未播种/全付费）兜底回确定性映射
-      avatar: (await pickRandomFreeAvatar()) ?? deterministicLocalAvatar(username),
+      // 注册头像走用户名的确定性映射（同名永远同头像）。原先是「从免费头像商品池随机取」，
+      // 头像商城下线后（§9.1）那批 avatar 商品行会被软下架，随机池必然为空，只剩这条路。
+      avatar: deterministicLocalAvatar(username),
       // oauthProvider 和 oauthId 留 null，表示本站邮箱注册
     },
     select: USER_PUBLIC_SELECT,
@@ -274,8 +274,9 @@ export async function telegramAuth(
       username,
       email: null,
       passwordHash: null,
-      // 有 TG 照片用照片，无照片从免费池随机分配；池为空兜底 null（前端确定性渲染）
-      avatar: data.photo_url ?? (await pickRandomFreeAvatar()) ?? null,
+      // 有 TG 照片用照片，无照片走确定性映射。⚠️ 这里原本兜底 null，配合免费头像池随机分配；
+      // 头像商城下线后池必为空，若仍留 null 则 TG 新用户会全部落成「无头像」，故必须给确定性兜底。
+      avatar: data.photo_url ?? deterministicLocalAvatar(username),
       oauthProvider: OAuthProvider.TELEGRAM,
       oauthId: tgId,
     },

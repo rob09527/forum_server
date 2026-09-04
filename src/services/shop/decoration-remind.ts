@@ -1,7 +1,7 @@
 import { prisma } from '../../lib/prisma.js'
 import { redis } from '../../lib/redis.js'
 import { RedisKey } from '../../constants/redis-keys.js'
-import { NotificationType, ShopItemType } from '../../constants/business.js'
+import { NotificationType } from '../../constants/business.js'
 import { createAndPush } from '../notification/notification.service.js'
 
 /**
@@ -17,9 +17,13 @@ import { createAndPush } from '../notification/notification.service.js'
 /** 每次扫描的上限，分批推进（一次调度最多处理 100 条，其余等下一轮） */
 const BATCH_SIZE = 100
 
-/** 到期通知的文案模板（name 为解析后的友好名：称号中文名 / 颜色中文名 / 头像「风格-NN」） */
+/**
+ * 到期通知的文案模板（name 为解析后的友好名：称号中文名 / 颜色中文名）。
+ * 头像已于 §9.1 从商城下线（不再是付费商品），故 subject 不再按类型分叉，统一「装饰」。
+ * type 保留在签名里：存量 user_decorations 行仍带类型，未来新增装饰类型时这里是唯一分叉点。
+ */
 function noticeContent(type: string, name: string): string {
-  const subject = type === ShopItemType.AVATAR ? '租用头像' : '装饰'
+  const subject = '装饰'
   return `你的${subject}「${name}」已到期，可前往商城续费`
 }
 
@@ -34,7 +38,11 @@ export async function checkAndNotifyExpired(): Promise<number> {
   const dayEnd = new Date(dayStart.getTime() + 86400_000)
 
   const expiring = await prisma.userDecoration.findMany({
-    where: { expireAt: { gte: dayStart, lt: dayEnd }, expiredNotifiedAt: null },
+    where: {
+      type: { in: ['title', 'username_color'] },
+      expireAt: { gte: dayStart, lt: dayEnd },
+      expiredNotifiedAt: null,
+    },
     select: { id: true, userId: true, type: true, renderValue: true },
     take: BATCH_SIZE,
   })

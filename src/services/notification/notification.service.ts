@@ -9,7 +9,6 @@ import {
 } from '../../constants/business.js'
 import type { SystemNotifyTargetType, NotificationTypeType } from '../../constants/business.js'
 import { redis, RedisKey } from '../../lib/redis.js'
-import { effectiveAvatar } from '../../utils/avatar.js'
 import { pushToUser, pushToAllOnline } from '../realtime/sse.js'
 import { extractMentionedUserIds } from '../../utils/mention.js'
 
@@ -323,7 +322,7 @@ export async function listNotifications(
   ])
 
   const actorMap = new Map(
-    actors.map((a) => [a.id, { id: a.id, username: a.username, avatar: effectiveAvatar(a.avatar, a.decorAvatarValue, a.decorAvatarExpireAt) }]),
+    actors.map((a) => [a.id, { id: a.id, username: a.username, avatar: a.avatar }]),
   )
   const postMap = new Map(posts.map((p) => [p.id, p]))
   const commentMap = new Map(comments.map((c) => [c.id, c]))
@@ -448,7 +447,10 @@ export async function broadcastSystemNotification(
   }
 
   // ── target=all / role：DB 条件 + 游标流式分批，不一次物化全部 ID ──
-  const userWhere: Prisma.UserWhereInput = { status: UserStatus.ACTIVE }
+  // isShadow=false：影子用户是导入数据的作者载体（passwordHash=null，永远无法登录），
+  // 给他们发公告会白写 3 万行 notifications，且回给后台的 sentCount 变成
+  // 「触达 3 万人」的假指标，会误导运营决策。
+  const userWhere: Prisma.UserWhereInput = { status: UserStatus.ACTIVE, isShadow: false }
   if (input.target === SystemNotifyTarget.ROLE) {
     if (!input.role) {
       throw new ValidationError('按角色群发需指定角色', ErrorCode.VALIDATION_ERROR)

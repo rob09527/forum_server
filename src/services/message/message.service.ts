@@ -8,6 +8,7 @@ import { NotFoundError, ForbiddenError, ValidationError } from '../../utils/erro
 import { isFollowing } from '../follow/follow.service.js'
 import { pushToUser } from '../realtime/sse.js'
 import { AUTHOR_SELECT, toAuthorBrief, type AuthorBrief } from '../user/user-decorator.js'
+import { getLimitsConfig } from '../config/config.service.js'
 
 /**
  * 用户私信（1v1 会话化）服务。
@@ -24,12 +25,13 @@ import { AUTHOR_SELECT, toAuthorBrief, type AuthorBrief } from '../user/user-dec
  * - 未读总数用 Redis 计数器（dmUnread），已读时失效缓存走 SUM 对账（对齐 notification 模式）。
  */
 
-/** 私信正文长度上限（纯文本 v1） */
-const DM_CONTENT_MAX_LENGTH = 2000
-/** 会话列表预览截断长度 */
+/**
+ * 会话列表预览截断长度。
+ * 这一项仍是模块常量、**没有**进 `config:limits`：它是纯展示细节（列表里显示几个字），
+ * 不是运维需要调的频率/体积阈值。正文长度上限与发送频率则已收拢进 `config:limits`
+ * （`dmContentMaxLength` / `dmMaxPerMinute`，见 §11.7）。
+ */
 const DM_PREVIEW_LENGTH = 50
-/** 每分钟私信发送上限（防骚扰，对齐 uploadRate 模式） */
-const DM_MAX_PER_MINUTE = 30
 
 /** 分页结果 */
 export interface Paginated<T> {
@@ -234,11 +236,9 @@ export async function sendMessage(
   if (content.length < 1) {
     throw new ValidationError('私信内容不能为空', ErrorCode.DM_CONTENT_INVALID)
   }
-  if (content.length > DM_CONTENT_MAX_LENGTH) {
-    throw new ValidationError(
-      `私信最长 ${DM_CONTENT_MAX_LENGTH} 字`,
-      ErrorCode.DM_CONTENT_INVALID,
-    )
+  const { dmContentMaxLength } = await getLimitsConfig()
+  if (content.length > dmContentMaxLength) {
+    throw new ValidationError(`私信最长 ${dmContentMaxLength} 字`, ErrorCode.DM_CONTENT_INVALID)
   }
 
   const conversation = await requireParticipant(conversationId, senderId)
@@ -375,16 +375,17 @@ async function enforceDmPrivacy(
   }
 }
 
-/** 私信发送频率限制（每分钟 DM_MAX_PER_MINUTE 条，对齐 upload.service 的 checkRateLimit） */
+/** 私信发送频率限制（上限取 `config:limits` 的 dmMaxPerMinute，对齐 upload.service 的 checkRateLimit） */
 async function checkDmRateLimit(userId: number): Promise<void> {
+  const { dmMaxPerMinute } = await getLimitsConfig()
   const key = RedisKey.dmRate(userId, formatMinute(new Date()))
   const count = await redis.incr(key)
   if (count === 1) {
     await redis.expire(key, 60)
   }
-  if (count > DM_MAX_PER_MINUTE) {
+  if (count > dmMaxPerMinute) {
     throw new ForbiddenError(
-      `私信发送太频繁，请稍后再试（每分钟最多 ${DM_MAX_PER_MINUTE} 条）`,
+      `私信发送太频繁，请稍后再试（每分钟最多 ${dmMaxPerMinute} 条）`,
       ErrorCode.DM_RATE_LIMITED,
     )
   }

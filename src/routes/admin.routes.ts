@@ -9,7 +9,13 @@ import { adminRefundBounty } from '../services/bounty/bounty.service.js'
 import { sweepExpiredBounties } from '../services/bounty/bounty-sweep.js'
 import { deletePostById } from '../services/post/post.service.js'
 import { broadcastSystemNotification } from '../services/notification/notification.service.js'
-import { getAllConfigs, setConfig, resetConfig, getLevels } from '../services/config/config.service.js'
+import {
+  getAllConfigs,
+  setConfig,
+  resetConfig,
+  getLevels,
+  CONFIG_GROUP_NAMES,
+} from '../services/config/config.service.js'
 import type { ConfigGroup } from '../services/config/config.service.js'
 import { recomputeLevels } from '../services/points/points.service.js'
 import { requireAdminKey } from '../middleware/admin-key.middleware.js'
@@ -243,7 +249,7 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
 
   /**
    * PUT /api/admin/config/:group
-   * 写入一组配置（checkin | levels | shop | tip | bounty | props）。
+   * 写入一组配置（组名见 CONFIG_GROUP_NAMES）。
    * 先按本组 zod schema 校验，非法值返回 400 不落库；校验通过后直写共享 Redis。
    */
   fastify.put(
@@ -255,7 +261,8 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
           type: 'object',
           required: ['group'],
           properties: {
-            group: { type: 'string', enum: ['checkin', 'levels', 'shop', 'tip', 'bounty', 'props'] },
+            // 组名枚举从 config.service 导出的单一事实来源取，别再手抄（新增第 7 组 limits 时两处都会漏）
+            group: { type: 'string', enum: CONFIG_GROUP_NAMES },
           },
         },
       },
@@ -282,7 +289,8 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
           type: 'object',
           required: ['group'],
           properties: {
-            group: { type: 'string', enum: ['checkin', 'levels', 'shop', 'tip', 'bounty', 'props'] },
+            // 组名枚举从 config.service 导出的单一事实来源取，别再手抄（新增第 7 组 limits 时两处都会漏）
+            group: { type: 'string', enum: CONFIG_GROUP_NAMES },
           },
         },
       },

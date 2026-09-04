@@ -67,3 +67,10 @@ export class InsufficientPointsError extends AppError {
     super(`余额不足，还差 ${needed - have} 🍗`, 400, ErrorCode.INSUFFICIENT_POINTS)
   }
 }
+
+/** 导入 worker 丢失 Redis 租约；调用方应中止本轮，避免旧 worker 继续写入。 */
+export class ImportLockLostError extends AppError {
+  constructor() {
+    super('导入任务锁已失效，本轮已中止', 503, ErrorCode.IMPORT_LOCK_LOST)
+  }
+}

@@ -1,0 +1,3 @@
+-- NodeLoc dataset; table=shop_items; rows=2
+INSERT INTO public."shop_items" ("id", "type", "name", "renderValue", "renderStyle", "price", "durationDays", "isActive", "sortOrder", "createdAt", "updatedAt") VALUES (42, 'title', '大腿在此', 'title-tag-datuizaici', NULL, 300, 30, TRUE, 9, '2026-08-25T07:33:27.734Z'::timestamptz, '2026-08-26T02:33:52.845Z'::timestamptz) ON CONFLICT DO NOTHING;
+INSERT INTO public."shop_items" ("id", "type", "name", "renderValue", "renderStyle", "price", "durationDays", "isActive", "sortOrder", "createdAt", "updatedAt") VALUES (60, 'username_color', '落日橙', '#FF7A00', NULL, 150, 30, TRUE, 1, '2026-08-25T07:33:27.734Z'::timestamptz, '2026-08-25T07:33:27.734Z'::timestamptz) ON CONFLICT DO NOTHING;

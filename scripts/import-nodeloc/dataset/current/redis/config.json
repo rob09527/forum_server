@@ -1,0 +1,65 @@
+{
+  "formatVersion": 1,
+  "note": "仅维护 NodeLoc 初始化需要的配置；不包含 session、缓存、锁、游标和计数器。",
+  "keys": {
+    "config:checkin": {
+      "base": 5,
+      "streakBonusPerDay": 1,
+      "streakBonusCap": 5,
+      "milestoneEvery": 7,
+      "milestoneBonus": 30
+    },
+    "config:levels": [
+      {
+        "key": "mythic",
+        "name": "神兽",
+        "minTotal": 3200
+      },
+      {
+        "key": "divine",
+        "name": "神鸟",
+        "minTotal": 1600
+      },
+      {
+        "key": "phoenix",
+        "name": "凤凰",
+        "minTotal": 800
+      },
+      {
+        "key": "pheasant",
+        "name": "山鸡",
+        "minTotal": 400
+      },
+      {
+        "key": "free",
+        "name": "走地鸡",
+        "minTotal": 200
+      },
+      {
+        "key": "whole",
+        "name": "整鸡",
+        "minTotal": 100
+      },
+      {
+        "key": "wing",
+        "name": "鸡翅",
+        "minTotal": 60
+      },
+      {
+        "key": "meat",
+        "name": "鸡肉",
+        "minTotal": 30
+      },
+      {
+        "key": "leg",
+        "name": "鸡腿",
+        "minTotal": 10
+      },
+      {
+        "key": "claw",
+        "name": "鸡爪",
+        "minTotal": 0
+      }
+    ]
+  }
+}

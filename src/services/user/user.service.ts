@@ -3,13 +3,15 @@ import { ErrorCode } from '../../constants/error-codes.js'
 import { NotFoundError, ValidationError, ForbiddenError } from '../../utils/errors.js'
 import { levelProgress } from '../points/points.service.js'
 import type { LevelProgress } from '../points/points.service.js'
-import { getLevels } from '../config/config.service.js'
-import { isAvatarFree } from '../shop/shop.service.js'
-import { ALLOWED_AVATAR_STYLES, AVATARS_PER_STYLE, ShopItemType, UserStatus } from '../../constants/business.js'
-import { effectiveAvatar } from '../../utils/avatar.js'
+import { getLevels, getLimitsConfig } from '../config/config.service.js'
+import { UserStatus } from '../../constants/business.js'
+import { UploadPartition, UPLOAD_URL_ROOT } from '../../constants/upload-paths.js'
+import { AvatarPathKind, assertAllowedAvatarPath, enforceUploadedAvatarLimits } from '../../utils/avatar.js'
+import { consumePendingAvatar, restorePendingAvatar, finalizePendingAvatar, cleanupReplacedAvatar } from '../upload/upload.service.js'
 import type { UserStatusType } from '../../constants/business.js'
 import type { UserPublic } from '../auth/auth.service.js'
 import { USER_PUBLIC_SELECT } from '../auth/auth.service.js'
+import { findPlaceholderUserId } from '../import/shadow-users.js'
 
 /**
  * 用户公开资料 + 积分流水服务。
@@ -109,11 +111,17 @@ export interface NewUserItem {
 
 /**
  * 最新注册用户 Top N（按注册时间倒序），侧边栏「欢迎新用户」模块用。
+ * 只取本站真实注册的 active 用户：
+ * - isShadow=false：导入的影子用户 createdAt = 其在对方站首次发言时间，而回填是从最新页往回走，
+ *   活跃影子会被赋上「最近几天」的注册时间，不排除会把「欢迎新用户」整块刷爆（终局 3 万影子 vs 几百真人）。
+ * - status=active：封禁/禁言账号不该出现在欢迎位。
+ * 走 users(isShadow, createdAt DESC) 复合索引，等值前缀 + 有序后缀，无需排序回表。
  */
 export async function getLatestUsers(limit = 8): Promise<NewUserItem[]> {
   const take = Math.min(50, Math.max(1, limit))
 
   const users = await prisma.user.findMany({
+    where: { isShadow: false, status: UserStatus.ACTIVE },
     orderBy: { createdAt: 'desc' },
     take,
     select: { id: true, username: true, avatar: true, decorAvatarValue: true, decorAvatarExpireAt: true, createdAt: true },
@@ -122,7 +130,7 @@ export async function getLatestUsers(limit = 8): Promise<NewUserItem[]> {
   return users.map((u) => ({
     id: u.id,
     username: u.username,
-    avatar: effectiveAvatar(u.avatar, u.decorAvatarValue, u.decorAvatarExpireAt),
+    avatar: u.avatar,
     createdAt: u.createdAt.toISOString(),
   }))
 }
@@ -146,6 +154,12 @@ const MENTION_SEARCH_LIMIT = 20
  * 按用户名前缀搜索 active 用户（@提及候选）。
  * 前缀匹配 + 大小写不敏感（ILIKE 'q%'）：当前用户量级下走全表扫描足够快；
  * 若用户量增长到扫描吃力，再给 username 建 pg_trgm GIN 索引支持中缀模糊（届时需迁移）。
+ *
+ * 影子用户（导入账号）的口径（产品已拍）：
+ * - 允许被 @：@ 一个导入作者能形成引用语义，有价值，所以不过滤。
+ * - 但真人优先：终局 3 万影子 vs 几百真人，字典序单排会让真人被挤出前 20，
+ *   故按 isShadow 升序（false < true）做首要排序键，真人先占满候选位。
+ * - 占位账号「已注销用户」例外剔除：@ 一个已注销用户没有任何意义。
  */
 export async function searchUsers(
   q: string,
@@ -156,13 +170,17 @@ export async function searchUsers(
     return []
   }
 
+  // 按 id 剔除占位账号，而不是比对用户名字符串（占位账号改名后字符串判定会静默失效）
+  const placeholderId = await findPlaceholderUserId()
+
   const take = Math.min(MENTION_SEARCH_LIMIT, Math.max(1, limit))
   const users = await prisma.user.findMany({
     where: {
       username: { startsWith: keyword, mode: 'insensitive' },
       status: UserStatus.ACTIVE,
+      ...(placeholderId !== null ? { id: { not: placeholderId } } : {}),
     },
-    orderBy: { username: 'asc' },
+    orderBy: [{ isShadow: 'asc' }, { username: 'asc' }],
     take,
     select: {
       id: true,
@@ -177,7 +195,7 @@ export async function searchUsers(
   return users.map((u) => ({
     id: u.id,
     username: u.username,
-    avatar: effectiveAvatar(u.avatar, u.decorAvatarValue, u.decorAvatarExpireAt),
+    avatar: u.avatar,
     level: u.level,
   }))
 }
@@ -252,7 +270,7 @@ export async function getUserProfile(userId: number, viewerId?: number): Promise
     id: user.id,
     username: user.username,
     // 头像折叠：租用头像未过期优先，否则基础头像
-    avatar: effectiveAvatar(user.avatar, user.decorAvatarValue, user.decorAvatarExpireAt),
+    avatar: user.avatar,
     bio: user.bio,
     level: progress.level,
     points: viewerId === userId ? user.points : null,
@@ -338,60 +356,94 @@ export async function getUserPointsLog(
   }
 }
 
-/** 本地预置头像路径格式：/avatars/{style}/avatar-{nn}.svg */
-const LOCAL_AVATAR_RE = /^\/avatars\/([a-z0-9-]+)\/avatar-(\d{2})\.svg$/
-
 /**
- * 更新当前用户的头像为本地预置头像（无外网依赖）。
+ * 更新当前用户的头像（§9.1 拆除「头像是付费商品」这道闸门后的形态）。
+ *
+ * 头像来源两条、**都免费**：
+ * 1. 本地预置模板 `/avatars/{风格}/avatar-NN.svg` —— 任选，不再需要在商城解锁；
+ * 2. 用户自定义上传 `/uploads/avatars/xxx` —— 先走通用 `POST /api/upload` 拿到相对路径，
+ *    再调本接口落库；体积/像素上限在此**服务端**强制（绕过前端直接 POST 也拦得住）。
+ *
+ * 合法性一律由 `assertAllowedAvatarPath` 的白名单二选一判定，⛔ 禁止「任意字符串直存」——
+ * 那等于开放任意外链注入到所有用户的头像位（SSRF / 追踪像素 / 站外图挂载）。
+ * 落库同时把已下线的租用覆盖层 `decorAvatarValue/ExpireAt` 置 null（两列已是死列，见 schema 注释）。
+ *
  * @param userId 用户 ID
- * @param avatar 本地头像路径，如 /avatars/bottts-neutral/avatar-03.svg
+ * @param avatar 头像相对路径（预置模板或站内上传，二选一）
  * @returns 更新后的用户公开信息
  */
 export async function updateAvatar(userId: number, avatar: string): Promise<UserPublic> {
-  const m = LOCAL_AVATAR_RE.exec(avatar)
-  const index = m ? Number(m[2]) : 0
-  if (!m || !ALLOWED_AVATAR_STYLES.includes(m[1] as any) || index < 1 || index > AVATARS_PER_STYLE) {
-    throw new ValidationError(
-      `无效的头像路径: ${avatar}，格式应为 /avatars/{风格}/avatar-01~${String(AVATARS_PER_STYLE).padStart(2, '0')}.svg`,
-      ErrorCode.VALIDATION_ERROR,
-    )
-  }
+  const kind = assertAllowedAvatarPath(avatar)
 
   const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true } })
   if (!user) {
     throw new NotFoundError('用户', ErrorCode.NOT_FOUND)
   }
 
-  // 头像商品化：免费头像可自选（写入基础头像）；付费头像需持有且未过期才能选用
-  // （购买/续费/商城切换走 decorAvatar 租用覆盖层，本接口同语义）。
-  // 播种前（无商品行）视为免费，向后兼容。
-  let data: { avatar: string; decorAvatarValue: null; decorAvatarExpireAt: null } | { decorAvatarValue: string; decorAvatarExpireAt: Date }
-  if (await isAvatarFree(avatar)) {
-    // 选免费头像即清除租用覆盖层（UserDecoration 持有记录保留，仅不再佩戴）
-    data = { avatar, decorAvatarValue: null, decorAvatarExpireAt: null }
-  } else {
-    // 付费头像：校验本人持有且未过期（type=avatar 且 renderValue 匹配的有效装饰）
-    const owned = await prisma.userDecoration.findFirst({
-      where: { userId, type: ShopItemType.AVATAR, renderValue: avatar, expireAt: { gt: new Date() } },
-      select: { expireAt: true },
-    })
-    if (!owned) {
-      throw new ForbiddenError('该头像需在商城购买解锁', ErrorCode.AVATAR_LOCKED)
+  let pendingSize: number | null = null
+  if (kind === AvatarPathKind.UPLOADED) {
+    pendingSize = await consumePendingAvatar(avatar, userId)
+    if (pendingSize === null) {
+      throw new ValidationError('头像上传已过期或不属于当前用户，请重新上传', ErrorCode.VALIDATION_ERROR)
     }
-    // 走租用覆盖层佩戴（与商城「切换」同语义），基础头像保留，到期自动回退
-    data = { decorAvatarValue: avatar, decorAvatarExpireAt: owned.expireAt }
   }
 
-  const updated = await prisma.user.update({
-    where: { id: userId },
-    data,
-    select: USER_PUBLIC_SELECT,
-  })
+  let finalSize = pendingSize
+  let committed = false
+  try {
+    if (kind === AvatarPathKind.UPLOADED) {
+      finalSize = await enforceUploadedAvatarLimits(avatar)
+    }
 
-  // 返回折叠后的生效头像（租用未过期则覆盖基础），前端 updateUser 回写即可 [avatar 商品化]
-  return {
-    ...updated,
-    avatar: effectiveAvatar(updated.avatar, updated.decorAvatarValue, updated.decorAvatarExpireAt),
-    status: updated.status as UserStatusType,
+    const updated = await prisma.$transaction(async (tx) => {
+      const current = await tx.user.findUnique({
+        where: { id: userId },
+        select: { avatar: true, uploadSize: true, uploadQuotaBonus: true },
+      })
+      if (!current) throw new NotFoundError('用户', ErrorCode.NOT_FOUND)
+
+      if (kind === AvatarPathKind.UPLOADED && finalSize !== null) {
+        const limits = await getLimitsConfig()
+        const effectiveLimit = limits.uploadMaxUserTotalSize + current.uploadQuotaBonus
+        // 用带条件的原子更新守住并发确认：先查再 increment 会让两个请求同时越过总量上限。
+        const claimed = await tx.user.updateMany({
+          where: { id: userId, uploadSize: { lte: effectiveLimit - finalSize } },
+          data: { uploadSize: { increment: finalSize } },
+        })
+        if (claimed.count !== 1) {
+          throw new ValidationError('上传总量已达上限', ErrorCode.UPLOAD_USER_TOTAL_EXCEEDED)
+        }
+      }
+
+      const updated = await tx.user.update({
+        where: { id: userId },
+        data: { avatar, decorAvatarValue: null, decorAvatarExpireAt: null },
+        select: USER_PUBLIC_SELECT,
+      })
+      return { updated, previousAvatar: current.avatar }
+    })
+
+    // 数据库已提交后，pending 只剩清理职责；清理失败不能回滚已生效的头像，
+    // 否则 catch 会重新登记一个已经被引用的资源，增加索引残留。
+    committed = true
+    if (kind === AvatarPathKind.UPLOADED && finalSize !== null) {
+      await finalizePendingAvatar(avatar, userId, pendingSize ?? finalSize).catch((err) => {
+        // sweepPendingAvatars 会通过 DB 引用兜底移除索引并保留文件；这里保留日志便于排查 Redis 故障。
+        console.error('[user] finalize pending avatar failed:', avatar, err)
+      })
+    }
+    if (updated.previousAvatar && updated.previousAvatar !== avatar) {
+      await cleanupReplacedAvatar(
+        updated.previousAvatar,
+        userId,
+        updated.previousAvatar.startsWith(`${UPLOAD_URL_ROOT}/${UploadPartition.AVATARS}/`),
+      ).catch((err) => console.error('[user] cleanup replaced avatar failed:', updated.previousAvatar, err))
+    }
+    return { ...updated.updated, status: updated.updated.status as UserStatusType }
+  } catch (err: unknown) {
+    if (kind === AvatarPathKind.UPLOADED && pendingSize !== null && !committed) {
+      await restorePendingAvatar(avatar, userId, pendingSize).catch(() => undefined)
+    }
+    throw err
   }
 }

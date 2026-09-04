@@ -90,10 +90,13 @@ model User {
   /// 称号到期时间，语义同 decorColorExpireAt
   decorTitleExpireAt  DateTime?
 
-  /// 生效中的租用头像路径（付费头像快照，/avatars/{style}/avatar-{nn}.svg）；未租用为 null
+  /// @deprecated 头像商城已下线（§9），保留待后续统一清理。
+  /// 原语义：生效中的租用头像路径（付费头像快照）。现已成死列 —— 头像不再是商品，
+  /// updateAvatar() 落库时一律写 null，渲染侧不再折叠双槽（直接读 User.avatar）。
+  /// ⚠️ 删列必须单独一轮：共享库只能 migrate deploy（红线 1），且 admin 的 TypeORM entity 要同步手抄（红线 3）。
   decorAvatarValue     String?
 
-  /// 租用头像到期时间；过期不清空，渲染时折叠回 User.avatar（基础头像），靠时间判定 [R46]
+  /// @deprecated 头像商城已下线（§9），保留待后续统一清理。语义同 decorAvatarValue，同为死列。
   decorAvatarExpireAt  DateTime?
 
   /// 上传配额加购字节数（扩容道具累加，永久有效）；
@@ -102,6 +105,12 @@ model User {
 
   /// 私信隐私开关：everyone(所有人可私信) | followers(仅关注我的人) | nobody(关闭私信)
   dmPrivacy      String    @default("everyone")
+
+  /// 是否为外站数据导入生成的「影子用户」(非本站真实注册用户)。
+  /// true 的账号 passwordHash 为 null 且 dmPrivacy 固定 nobody，永远无法登录，仅用于承载导入内容的作者身份。
+  /// 用途：把影子用户从「最新加入用户」「@提及候选」「系统公告触达统计」等面向真人的功能里排除。
+  /// 判定影子身份必须用本列，禁止用 email 后缀猜测，也不要 join import_user_mappings(18 万行)。
+  isShadow       Boolean   @default(false)
 
   /// 积分流水记录
   pointLogs     PointLog[]
@@ -143,6 +152,12 @@ model User {
   notifications  Notification[]
 
   @@index([status])
+  /// 首页侧边栏「最新加入」按注册时间倒序取前 N（getLatestUsers，每次渲染都跑）。
+  /// 导入后 users 约 3 万行，无此索引是全表扫 + top-N 排序。
+  @@index([createdAt(sort: Desc)])
+  /// 排除影子用户后按注册时间倒序（getLatestUsers / admin 用户列表筛「真实用户」）。
+  /// 导入后 3 万影子会把几百个真人彻底淹没，isShadow 前导才能让过滤走索引而不是全表扫。
+  @@index([isShadow, createdAt(sort: Desc)])
   @@map("users")
 }
 
@@ -371,6 +386,11 @@ model PointLog {
   @@index([userId, createdAt(sort: Desc)])
   /// 按类型派生限流（补签月次数、改名冷却）+ 后台按类型统计各出口消费占比 [1.6]
   @@index([userId, type, createdAt(sort: Desc)])
+  /// admin 后台「积分流水」列表默认无过滤、按时间倒序翻页。导入造数后约 20 万行，
+  /// 而上面两条索引都以 userId 前导用不上，无此索引时数据查询与 count 各做一次落盘排序。
+  @@index([createdAt(sort: Desc)])
+  /// admin 看板 getOverview 的 5 条聚合按 type 分组/筛选，20 万行下原本每次打开都全表扫 5 遍。
+  @@index([type])
   @@map("point_logs")
 }
 
@@ -556,6 +576,9 @@ model Notification {
 
   @@index([userId, isRead, createdAt(sort: Desc)])
   @@index([messageId])
+  /// admin 后台「通知」列表是全表 `ORDER BY createdAt DESC` 分页，userId 前导的复合索引用不上。
+  /// 导入后本表与 comments 同阶（约 16.8 万行），缺这条会全表扫 + 排序。
+  @@index([createdAt(sort: Desc)])
   @@map("notifications")
 }
 
@@ -589,6 +612,8 @@ model ShopItem {
   id           Int      @id @default(autoincrement())
 
   /// 装饰类型：username_color(用户名颜色) | title(专属称号)，同类互相覆盖、不同类共存 [1.3.3]
+  /// ⚠️ 历史上还有 avatar(头像)，已于 §9 下线：头像不再是付费商品（预置模板任选 + 自定义上传，均免费）。
+  /// 库里 360 行 type='avatar' 的历史商品行按「商品禁删只能下架」做软下架（isActive=false）保留，代码不再产生新的 avatar 商品。
   type         String
 
   /// 商品名（前台展示，如「幻紫」）
@@ -833,4 +858,78 @@ model Message {
   @@index([conversationId, createdAt])
   @@index([conversationId, id])
   @@map("messages")
+}
+
+/// 内容导入映射（NodeLoc/Discourse → 本地帖/评论）。
+/// 幂等导入与增量同步的基石：一行对应对方一个 post（含 1 楼 = 本地 Post，≥2 楼 = 本地 Comment）。
+model ImportMapping {
+  /// 映射 ID，自增主键
+  id               Int      @id @default(autoincrement())
+
+  /// 数据来源标识，目前固定 'nodeloc'（预留多来源）
+  source           String   @default("nodeloc")
+
+  /// 对方 topic id（Discourse 主题 ID）
+  sourceTopicId    Int
+
+  /// 对方 post id（Discourse 楼层全局 ID，全站唯一，增量游标依据）
+  sourcePostId     Int
+
+  /// 对方楼层号 post_number（1=主帖；同步定位用，本地 floor 不照抄它）
+  sourcePostNumber Int
+
+  /// 对方 post 编辑版本号 version，增量同步比对编辑用
+  sourceVersion    Int      @default(1)
+
+  /// 本地帖子 ID（post_number=1 时有值），帖子删除后置空保留映射防重复导入
+  localPostId      Int?
+
+  /// 本地评论 ID（post_number≥2 时有值）
+  localCommentId   Int?
+
+  /// 本地作者用户 ID（影子账号）
+  localUserId      Int
+
+  /// 本地优先锁：admin 对该内容有管理动作后置 true，增量同步不再覆盖
+  locked           Boolean  @default(false)
+
+  /// 最后同步时间
+  syncedAt         DateTime @default(now())
+
+  /// 同一来源同一 post 只导一次（并发/重跑幂等兜底）
+  @@unique([source, sourcePostId])
+  @@index([source, sourceTopicId])
+  @@index([localPostId])
+  /// 增量 worker 删评论/删主题时按本地评论 id 反查映射行置空
+  /// （import-sync.service.ts 的 localCommentId in (...) 与 verify.ts 悬空引用自检）。
+  /// 导入后本表约 18 万行，无此索引这些路径是全表扫。
+  @@index([localCommentId])
+  @@map("import_mappings")
+}
+
+/// 用户身份归一映射（Discourse 不可变数字 user_id → 本地影子账号）。
+/// 对方改名不影响归属；同一真实用户跨帖/跨阶段的所有内容必然归同一本地账号。
+model ImportUserMapping {
+  /// 映射 ID，自增主键
+  id             Int      @id @default(autoincrement())
+
+  /// 数据来源标识，目前固定 'nodeloc'
+  source         String   @default("nodeloc")
+
+  /// 对方数字 user_id（不可变身份锚点）
+  sourceUserId   Int
+
+  /// 建映射时对方的用户名（仅审计参考，可能过期，不作身份依据）
+  sourceUsername String
+
+  /// 本地影子账号用户 ID
+  localUserId    Int
+
+  /// 创建时间
+  createdAt      DateTime @default(now())
+
+  /// 同一来源同一用户只建一个影子账号（并发 get-or-create 兜底）
+  @@unique([source, sourceUserId])
+  @@index([localUserId])
+  @@map("import_user_mappings")
 }

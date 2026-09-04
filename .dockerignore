@@ -5,3 +5,6 @@ logs/
 public/uploads/*
 !public/uploads/.gitkeep
 .git/
+# NodeLoc 初始化准备文件（253MB SQL，运行时经 compose 只读 bind-mount，不进镜像）
+scripts/import-nodeloc/dataset/
+src/scripts/import-nodeloc/dataset/

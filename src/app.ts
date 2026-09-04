@@ -11,6 +11,9 @@ import { ErrorCode } from './constants/error-codes.js'
 import { AppError } from './utils/errors.js'
 import { validationMessage } from './utils/validation.js'
 import { csrfGuard } from './plugins/csrf.js'
+import { getLimitsConfig } from './services/config/config.service.js'
+import { startConfigInvalidationSubscriber } from './services/config/config-cache.js'
+import { RateBucket, resolveRateBucket } from './services/config/rate-buckets.js'
 import { announcementRoutes } from './routes/announcement.routes.js'
 import { advertRoutes } from './routes/advert.routes.js'
 import { authRoutes } from './routes/auth.routes.js'
@@ -104,12 +107,40 @@ fastify.addHook('onRequest', csrfGuard(ALLOWED_ORIGINS))
 
 await fastify.register(cookie)
 
-// 全局限流：默认每 IP 每分钟 600 次。认证端点（login/register/telegram）在路由内按需收紧到 5 次。
-// errorResponseBuilder 统一错误格式，避免破坏前端 extractErrorMessage 的解析。
+// 配置失效订阅：必须在任何配置读取之前启动，否则本实例收不到其它实例的变更广播（见 config-cache.ts）
+startConfigInvalidationSubscriber()
+
+/**
+ * 全局限流：**按 IP + 桶** 计数，三个桶的阈值都存 `config:limits`（后台可改，改完即时生效）。
+ * 认证端点（login/register/telegram）在路由内用 `config.rateLimit` 收紧到 5 次 —— 那些是
+ * 路由级覆盖，插件会给它们单独开 `store.child()`，与这里的全局 key 互不干扰。
+ *
+ * ⚠️ 两个必须成对出现的点：
+ * 1. `max` **必须写函数形式**。写成常量（原先的 `max: 600`）时，插件只在注册那一刻读一次值，
+ *    后台改了配置也永远不生效。函数形式则每请求求值一次（@fastify/rate-limit 10.x 支持 async）。
+ * 2. `keyGenerator` **必须带桶名后缀**。插件的计数是按 keyGenerator 返回的 key 存一条，
+ *    只改 `max` 不改 key，三类请求仍共用同一个计数器 —— 那是「一个桶、阈值乱跳」，
+ *    翻两页头像就把 `/api/*` 的配额吃光，正是 §8.7 第 3 项那个「首页空列表 + 头像批量裂图」。
+ *
+ * `cache` 从默认 5000 提到 15000：每 IP 现在最多占 3 个 key，不提的话可容纳的独立 IP 数会掉到 1/3
+ * （LRU 淘汰的后果是计数被重置、限流失效，属于 fail-open，但仍应避免）。
+ */
 await fastify.register(rateLimit, {
   global: true,
-  max: 600,
   timeWindow: '1 minute',
+  cache: 15_000,
+  keyGenerator: (request) => `${request.ip}:${resolveRateBucket(request.url)}`,
+  max: async (request) => {
+    const limits = await getLimitsConfig()
+    switch (resolveRateBucket(request.url)) {
+      case RateBucket.AVATAR:
+        return limits.avatarFetchPerMinute
+      case RateBucket.IMAGE:
+        return limits.imageFetchPerMinute
+      default:
+        return limits.apiRatePerMinute
+    }
+  },
   // errorResponseBuilder 必须「throw」一个带 statusCode + code 的错误对象，
   // 走全局 errorHandler 的 AppError 分支统一格式化（若返回 body 会被当 500 处理）。
   errorResponseBuilder: (_request, _context) =>
@@ -117,9 +148,15 @@ await fastify.register(rateLimit, {
 })
 
 // multipart 文件上传（解析限制 = 单文件上限 + 1MB 缓冲，略大于应用层校验以先兜住大文件）
+//
+// ⚠️ 这里只能在启动时读一次：@fastify/multipart 的 limits 由 busboy 在注册时接管，不支持函数形式。
+// 后果是**「调小」即时生效**（应用层 upload.service 校验按当前配置走），
+// 而**「调大」超过启动时的值需要重启 forum**（解析器会先把请求截断）。
+// 没有把这里放宽到 schema 上界（100MB），是因为那等于把内存 DoS 面永久开到最大。
+const bootLimits = await getLimitsConfig()
 await fastify.register(multipart, {
   limits: {
-    fileSize: config.UPLOAD_MAX_FILE_SIZE + 1024 * 1024,
+    fileSize: bootLimits.uploadMaxFileSize + 1024 * 1024,
     files: 1,
   },
 })

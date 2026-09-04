@@ -9,6 +9,9 @@ import { getShopConfig } from '../config/config.service.js'
 /**
  * 装饰商城服务（docs/积分消费体系.md 2.2）。
  *
+ * ⚠️ 头像已于 §9.1 从商城下线：头像不再是付费商品（预置模板任选 + 自定义上传，均免费），
+ * 本服务只处理 username_color / title 两类。库里 360 行 type='avatar' 的历史商品行做软下架保留。
+ *
  * 产品核心（1.3）：
  * - 装饰一律时效制，不做永久；同类可持有多个（各自按到期时间自然失效），
  *   佩戴槽（用户表 decorTitle/decorColor）任意时刻只指向其中一个，可在「我的」切换 [产品调整]
@@ -111,10 +114,9 @@ export async function buyDecoration(userId: number, itemId: number): Promise<{ b
     const it = item[0]
     if (!it) throw new NotFoundError('商品', ErrorCode.ITEM_NOT_FOUND)
     if (!it.isActive) throw new ForbiddenError('商品已下架', ErrorCode.ITEM_NOT_ACTIVE)
-    // 免费池头像禁止购买：永久有效不过期、不在商城售卖（个人资料直接选用）。
-    // 防御直接调 API 绕过前端筛选（商城列表虽过滤 price>0，但商品行仍在库）。
-    if (it.type === ShopItemType.AVATAR && it.price === 0) {
-      throw new ForbiddenError('免费头像无需购买，永久有效，请在个人资料直接选择', ErrorCode.AVATAR_FREE_PURCHASE)
+    if (it.type !== ShopItemType.TITLE && it.type !== ShopItemType.USERNAME_COLOR) {
+      // 头像等历史类型只保留为存量数据，禁止通过直调 API 重新购买或写入错误佩戴槽。
+      throw new ForbiddenError('该商品类型已下线', ErrorCode.ITEM_NOT_ACTIVE)
     }
 
     const now = new Date()
@@ -123,14 +125,12 @@ export async function buyDecoration(userId: number, itemId: number): Promise<{ b
     // 2. 条件扣款 [R44]；refId 指向商品，商城流水可关联到具体商品
     await spendPoints(userId, PointType.SHOP, it.price, { refId: itemId }, tx)
 
-    // 3. 单槽覆盖语义（1.3.3）：颜色/称号/头像各只保留一个生效槽
-    // 头像写入 decorAvatarValue/ExpireAt（覆盖层），渲染时折叠覆盖 User.avatar（基础头像）
+    // 3. 单槽覆盖语义（1.3.3）：颜色/称号各只保留一个生效槽
+    // 头像已于 §9.1 下线（不再是商品），故只剩两类
     const slotFields =
       it.type === ShopItemType.USERNAME_COLOR
         ? { decorColorValue: it.renderValue, decorColorExpireAt: expireAt }
-        : it.type === ShopItemType.AVATAR
-          ? { decorAvatarValue: it.renderValue, decorAvatarExpireAt: expireAt }
-          : { decorTitleValue: it.renderValue, decorTitleStyle: it.renderStyle ?? null, decorTitleExpireAt: expireAt }
+        : { decorTitleValue: it.renderValue, decorTitleStyle: it.renderStyle ?? null, decorTitleExpireAt: expireAt }
     await tx.user.update({ where: { id: userId }, data: slotFields })
 
     // 4. UserDecoration：一商品一行；续费延长 expireAt；购买新同类装饰不置旧行失效（多持有 [产品调整]）
@@ -169,7 +169,8 @@ export async function buyDecoration(userId: number, itemId: number): Promise<{ b
  */
 export async function listShopItems(viewerId?: number): Promise<ShopListResult> {
   const items: ShopItemDTO[] = (await prisma.shopItem.findMany({
-    where: { isActive: true },
+    // avatar 是历史商品类型，已下线；即使旧数据误标为上架也不能重新出现在商城。
+    where: { isActive: true, type: { in: [ShopItemType.TITLE, ShopItemType.USERNAME_COLOR] } },
     orderBy: [{ type: 'asc' }, { sortOrder: 'asc' }],
     select: {
       id: true,
@@ -219,7 +220,7 @@ export async function listShopItems(viewerId?: number): Promise<ShopListResult> 
 export async function listMyDecorations(userId: number): Promise<MyDecorationGroup[]> {
   const [rows, user] = await Promise.all([
     prisma.userDecoration.findMany({
-      where: { userId },
+      where: { userId, type: { in: [ShopItemType.TITLE, ShopItemType.USERNAME_COLOR] } },
       orderBy: [{ type: 'asc' }, { expireAt: 'desc' }],
       select: {
         id: true,
@@ -234,7 +235,7 @@ export async function listMyDecorations(userId: number): Promise<MyDecorationGro
     }),
     prisma.user.findUnique({
       where: { id: userId },
-      select: { decorTitleValue: true, decorColorValue: true, decorAvatarValue: true },
+      select: { decorTitleValue: true, decorColorValue: true },
     }),
   ])
 
@@ -247,7 +248,6 @@ export async function listMyDecorations(userId: number): Promise<MyDecorationGro
 
   const wornTitle = user?.decorTitleValue ?? null
   const wornColor = user?.decorColorValue ?? null
-  const wornAvatar = user?.decorAvatarValue ?? null
 
   const now = Date.now()
   const groups = new Map<ShopItemTypeType, MyDecorationItem[]>()
@@ -266,9 +266,7 @@ export async function listMyDecorations(userId: number): Promise<MyDecorationGro
       active: r.expireAt.getTime() > now,
       worn: type === ShopItemType.TITLE
         ? wornTitle != null && wornTitle === r.renderValue
-        : type === ShopItemType.AVATAR
-          ? wornAvatar != null && wornAvatar === r.renderValue
-          : wornColor != null && wornColor === r.renderValue,
+        : wornColor != null && wornColor === r.renderValue,
     }
     const list = groups.get(type) ?? []
     list.push(item)
@@ -292,37 +290,8 @@ export async function activateDecoration(userId: number, decorationId: number): 
     where: { id: userId },
     data: dec.type === ShopItemType.USERNAME_COLOR
       ? { decorColorValue: dec.renderValue, decorColorExpireAt: dec.expireAt }
-      : dec.type === ShopItemType.AVATAR
-        ? { decorAvatarValue: dec.renderValue, decorAvatarExpireAt: dec.expireAt }
-        : { decorTitleValue: dec.renderValue, decorTitleStyle: dec.renderStyle ?? null, decorTitleExpireAt: dec.expireAt },
+      : { decorTitleValue: dec.renderValue, decorTitleStyle: dec.renderStyle ?? null, decorTitleExpireAt: dec.expireAt },
   })
 
   return { expireAt: dec.expireAt }
-}
-
-/**
- * 从免费头像池随机取一个（注册默认头像用）。
- * 免费 = type='avatar' 且 price=0 且上架。池为空（尚未播种/全设成付费）返回 null，调用方兜底。
- */
-export async function pickRandomFreeAvatar(): Promise<string | null> {
-  const rows = await prisma.shopItem.findMany({
-    where: { type: ShopItemType.AVATAR, price: 0, isActive: true },
-    select: { renderValue: true },
-  })
-  if (rows.length === 0) return null
-  return rows[Math.floor(Math.random() * rows.length)].renderValue
-}
-
-/**
- * 判断某头像路径是否免费可自选。
- * - 无商品行（尚未播种）→ 视为免费（向后兼容，不锁改头像）；
- * - 有行 → 免费 = price=0 且上架（下架视为不可用，即便价格为 0）。
- */
-export async function isAvatarFree(path: string): Promise<boolean> {
-  const row = await prisma.shopItem.findFirst({
-    where: { type: ShopItemType.AVATAR, renderValue: path },
-    select: { price: true, isActive: true },
-  })
-  if (!row) return true
-  return row.price === 0 && row.isActive
 }

@@ -194,9 +194,17 @@ export async function createComment(
 }
 
 /**
+ * 评论树逐层展开的深度上限。
+ * 正常数据只有两层（顶层楼层 + 楼中楼）：导入链路显式把回复拍平到顶层评论下，
+ * createComment 允许回复楼中楼、理论上能继续加深，但界面不提供更深的入口。
+ * 这里留足余量并设硬上限，防脏数据（parentId 成环）把逐层展开变成死循环。
+ */
+const MAX_REPLY_DEPTH = 10
+
+/**
  * 获取帖子评论列表。
- * 拉取帖子全部评论，构建完整递归树，再对顶层节点分页。
- * 按楼层号升序（顶层），楼中楼按创建时间升序。
+ * 顶层楼层在 DB 层分页（按楼层号升序），再逐层批量取本页楼层下的楼中楼挂成树。
+ * 楼中楼按创建时间升序。
  */
 export async function listPostComments(
   postId: number,
@@ -208,58 +216,73 @@ export async function listPostComments(
     throw new NotFoundError('帖子', ErrorCode.POST_NOT_FOUND)
   }
 
-  const skip = (Math.max(1, page) - 1) * Math.min(50, Math.max(1, pageSize))
+  const safePage = Math.max(1, page)
   const take = Math.min(50, Math.max(1, pageSize))
+  const skip = (safePage - 1) * take
 
-  // 一次性拉取该帖子下所有评论（不再限制深度）
-  const allComments = await prisma.comment.findMany({
-    where: { postId },
-    orderBy: { createdAt: 'asc' },
-    include: {
-      author: { select: AUTHOR_SELECT },
-    },
-  })
+  // 分页只作用于顶层楼层（与 post.commentCount 同口径：楼中楼不占楼层、不计数）。
+  // total 用 count 实查而不是读 post.commentCount 冗余列：冗余列一旦漂移会直接错到
+  // totalPages 上（末页空白或整页取不到），而单帖评论数天然有界，这次 count 走
+  // (postId, createdAt) 索引、代价可忽略，且与下面的分页查询并发发出，不多一趟往返。
+  const [total, topLevel] = await Promise.all([
+    prisma.comment.count({ where: { postId, parentId: null } }),
+    prisma.comment.findMany({
+      where: { postId, parentId: null },
+      // floor 升序 + NULLS LAST，等价于旧实现「无楼层的排最后」的 JS 排序语义。
+      // floor 有天然空洞（deleteComment 从不重排楼层），所以只能用 skip/take 定位，
+      // 不能拿 floor 当 offset 反推。同帖 floor 唯一，后两个排序键只为 null 楼层兜底稳定。
+      orderBy: [{ floor: { sort: 'asc', nulls: 'last' } }, { createdAt: 'asc' }, { id: 'asc' }],
+      skip,
+      take,
+      include: {
+        author: { select: AUTHOR_SELECT },
+      },
+    }),
+  ])
 
-  // 构建完整递归树：id → CommentTreeItem
+  // 本页顶层楼层先建节点，id → 节点，供楼中楼挂载
   const map = new Map<number, CommentTreeItem>()
-  const topLevel: CommentTreeItem[] = []
-
-  // 第一遍：所有评论转为 CommentTreeItem，放入 map
-  for (const c of allComments) {
+  const items: CommentTreeItem[] = topLevel.map((c) => {
     const item: CommentTreeItem = { ...toItem(c), replies: [] }
     map.set(c.id, item)
-  }
-
-  // 第二遍：按 parentId 挂入父节点的 replies
-  for (const c of allComments) {
-    const item = map.get(c.id)!
-    if (c.parentId !== null) {
-      const parent = map.get(c.parentId)
-      if (parent) {
-        parent.replies.push(item)
-      } else {
-        // 父评论不在本帖子内（理论上不应发生），降级为顶层
-        topLevel.push(item)
-      }
-    } else {
-      topLevel.push(item)
-    }
-  }
-
-  // 顶层按楼层号排序（无楼层的回复排在最后）
-  topLevel.sort((a, b) => {
-    if (a.floor === null && b.floor === null) return 0
-    if (a.floor === null) return 1
-    if (b.floor === null) return -1
-    return a.floor - b.floor
+    return item
   })
 
-  const total = topLevel.length
-  const items = topLevel.slice(skip, skip + take)
+  // 楼中楼逐层批量展开：每层只发一次 parentId in (上一层 ids)。
+  // 循环里 await 是因为下一层的 ids 依赖上一层结果，查询次数 = 树深（正常两层 → 1 次），
+  // 不随评论条数增长，不是按父评论逐条查的 N+1。只捞本页楼层的子孙，
+  // 作者也只 include 这些行需要的，其它楼层的评论与作者完全不进内存。
+  // visited 是输出契约的一部分：即使历史脏数据出现重复 parentId/环，也不得重复挂载或继续追踪。
+  const visited = new Set<number>(topLevel.map((c) => c.id))
+  let frontier = [...visited]
+  for (let depth = 1; frontier.length > 0 && depth <= MAX_REPLY_DEPTH; depth++) {
+    const replies = await prisma.comment.findMany({
+      where: { postId, parentId: { in: frontier } },
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      include: {
+        author: { select: AUTHOR_SELECT },
+      },
+    })
+    if (replies.length === 0) break
+
+    const next: number[] = []
+    for (const r of replies) {
+      if (visited.has(r.id)) continue
+      const parent = map.get(r.parentId!)
+      // 理论不可达：parentId 取自上一层的 ids，父节点必在 map 里
+      if (!parent) continue
+      const item: CommentTreeItem = { ...toItem(r), replies: [] }
+      parent.replies.push(item)
+      map.set(r.id, item)
+      visited.add(r.id)
+      next.push(r.id)
+    }
+    frontier = next
+  }
 
   return {
     items,
-    page: Math.max(1, page),
+    page: safePage,
     pageSize: take,
     total,
     totalPages: Math.ceil(total / take),

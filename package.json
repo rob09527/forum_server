@@ -13,7 +13,9 @@
     "db:studio": "prisma studio",
     "db:generate": "prisma generate",
     "search:reindex": "tsx src/scripts/reindex.ts",
-    "points:audit": "tsx src/scripts/audit-points.ts"
+    "points:audit": "tsx src/scripts/audit-points.ts",
+    "nodeloc:extract": "tsx src/scripts/import-nodeloc/extract-nodeloc-sql.ts",
+    "nodeloc:init": "tsx src/scripts/import-nodeloc/initialize-nodeloc.ts"
   },
   "dependencies": {
     "@fastify/cookie": "^11.0.0",
@@ -31,13 +33,16 @@
     "jose": "^5.9.0",
     "meilisearch": "~0.48.0",
     "nanoid": "^5.1.0",
+    "node-emoji": "^2.2.0",
     "pg": "^8.23.0",
     "sharp": "^0.35.3",
     "slugify": "^1.6.0",
+    "unicode-emoji-json": "^0.9.0",
     "zod": "^3.24.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@types/pg": "^8.23.1",
     "prisma": "^7.7.0",
     "tsx": "^4.19.0",
     "typescript": "^5.8.0",

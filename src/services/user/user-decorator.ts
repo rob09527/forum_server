@@ -1,4 +1,3 @@
-import { effectiveAvatar } from '../../utils/avatar.js'
 
 /**
  * 作者公开摘要 + 装饰生效槽（消费体系 1.3.7 装饰全站渲染的后端半边）。
@@ -53,14 +52,14 @@ export type AuthorRow = AuthorBrief & {
 
 /**
  * 原始 author 行 → AuthorBrief。
- * 统一在此折叠「生效头像」：租用头像（decorAvatarValue）未过期优先，否则基础头像（avatar）。
- * 所有消费 AUTHOR_SELECT 的服务在映射 DTO 时调用，保证双槽对下游透明。
+ * 所有消费 AUTHOR_SELECT 的服务在映射 DTO 时调用。
+ * 头像原先在此折叠「租用头像覆盖基础头像」的双槽，头像商城下线后（§9.1）只剩单槽，直接透传 avatar。
  */
 export function toAuthorBrief(row: AuthorRow): AuthorBrief {
   return {
     id: row.id,
     username: row.username,
-    avatar: effectiveAvatar(row.avatar, row.decorAvatarValue, row.decorAvatarExpireAt),
+    avatar: row.avatar,
     level: row.level,
     decorColorValue: row.decorColorValue,
     decorColorExpireAt: row.decorColorExpireAt,

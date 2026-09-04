@@ -3,6 +3,8 @@ import { config } from './config.js'
 import { ensurePostsIndex } from './lib/meilisearch.js'
 import { checkAndNotifyExpired } from './services/shop/decoration-remind.js'
 import { sweepExpiredBounties } from './services/bounty/bounty-sweep.js'
+import { runImportSync } from './services/import/import-sync.service.js'
+import { sweepPendingAvatars } from './services/upload/upload.service.js'
 
 // 确保 Meili 帖子索引存在并应用设置（幂等）。不阻塞启动——搜索是派生能力，
 // Meili 暂时不可用时服务照常启动，索引就绪后可用 search:reindex 回填。
@@ -18,6 +20,11 @@ const SCHEDULE_INTERVAL_MS = 60_000
 setInterval(async () => {
   await runScheduled('bounty-sweep', sweepExpiredBounties)
   await runScheduled('decoration-remind', checkAndNotifyExpired)
+  await runScheduled('pending-avatar-sweep', sweepPendingAvatars)
+  // NodeLoc 增量同步：默认关闭；开启后由 Redis 锁 TTL 降频到实际 120s 一轮
+  if (config.IMPORT_SYNC_ENABLED) {
+    await runScheduled('import-sync', runImportSync)
+  }
 }, SCHEDULE_INTERVAL_MS)
 
 /** 调度器兜底：任务抛错只记日志，不影响后续任务与进程存活 */

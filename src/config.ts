@@ -47,6 +47,16 @@ const envSchema = z.object({
   /** 帖子正文最少字符数，防止水帖，默认 10 */
   POST_MIN_CONTENT_LENGTH: z.coerce.number().int().positive().default(10),
 
+  /**
+   * NodeLoc 增量同步开关，默认关闭。
+   * 必须在「全量回填 + 阶段 2.5 造数」都完成后才置 true，
+   * 否则实时积分重放会与造数重复计账（见 docs/NodeLoc数据迁移手册.md）。
+   */
+  IMPORT_SYNC_ENABLED: z
+    .string()
+    .default('true')
+    .transform((v) => v === 'true'),
+
   // ── 搜索（Meilisearch） ──
   /** Meilisearch 地址，本地 dev 用 Homebrew 原生实例，生产填 compose 内服务名 */
   MEILI_HOST: z.string().default('http://localhost:7700'),

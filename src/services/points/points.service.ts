@@ -34,7 +34,7 @@ export type EarnablePointType = Exclude<IncomePointType, typeof PointType.TRANSF
  * [R2] 评论 +3，当日最多 10 次有分（上限 30）
  * [R3] 被赞 +1，被动收入天然受限，不设次数上限
  */
-const POINT_RULES: Record<EarnablePointType, { delta: number; dailyTimes?: number }> = {
+export const POINT_RULES: Record<EarnablePointType, { delta: number; dailyTimes?: number }> = {
   [PointType.CHECKIN]: { delta: 0 }, // 签到得分由 checkin.service 按连续规则实时计算，不走固定值
   [PointType.POST]: { delta: 10, dailyTimes: 3 },
   [PointType.COMMENT]: { delta: 3, dailyTimes: 10 },

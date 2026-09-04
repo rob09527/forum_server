@@ -1,0 +1,27 @@
+{
+  "formatVersion": 1,
+  "dataset": "nodeloc",
+  "generatedAt": "2026-09-04T10:24:53.814Z",
+  "mode": "final-state",
+  "tables": {
+    "categories": 9,
+    "shop_items": 2,
+    "users": 12654,
+    "posts": 11483,
+    "comments": 236708,
+    "post_likes": 0,
+    "comment_likes": 0,
+    "bookmarks": 0,
+    "follows": 34063,
+    "tips": 540,
+    "bounties": 0,
+    "user_decorations": 257,
+    "point_logs": 296497,
+    "import_user_mappings": 12654,
+    "import_mappings": 248191
+  },
+  "shadowUserCount": 12654,
+  "postCount": 11483,
+  "commentCount": 236708,
+  "assets": "manual"
+}
