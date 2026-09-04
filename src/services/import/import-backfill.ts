@@ -20,7 +20,7 @@ const BACKFILL_BUDGET_MS = 100_000
 
 /** 单页主题状态计数,仅用于本轮日志(跨 tick 累计数不值得为此持久化) */
 function emptyStats(): Record<ImportTopicStatus, number> {
-  return { imported: 0, skipped: 0, excluded: 0, missing: 0, empty: 0 }
+  return { imported: 0, skipped: 0, excluded: 0, missing: 0, empty: 0, filtered: 0 }
 }
 
 export async function runBackfillTick(assertLock: () => void): Promise<'done' | 'more'> {
@@ -86,7 +86,7 @@ export async function runBackfillTick(assertLock: () => void): Promise<'done' | 
     const elapsedSec = Math.round((Date.now() - startedAt) / 1000)
     console.log(
       `[import-backfill] 第 ${pageDone} 页完成 | 本轮 ${processed} 主题 | ` +
-        `imported ${stats.imported} / skipped ${stats.skipped} / excluded ${stats.excluded} / missing ${stats.missing} / empty ${stats.empty} | ${elapsedSec}s`,
+        `imported ${stats.imported} / skipped ${stats.skipped} / excluded ${stats.excluded} / missing ${stats.missing} / empty ${stats.empty} / filtered ${stats.filtered} | ${elapsedSec}s`,
     )
 
     if (inWindow.length < topics.length) {

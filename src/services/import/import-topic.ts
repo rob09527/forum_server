@@ -4,6 +4,7 @@ import { IMPORT_SOURCE } from './import-config.js'
 import { resolveCategory } from './category-map.js'
 import { resolveTopicImages } from './import-images.js'
 import { cleanMarkdown } from './clean-markdown.js'
+import { containsBannedContent } from './content-filter.js'
 import { resolvePostAuthor } from './shadow-users.js'
 import type { DiscourseTopicDetail, DiscoursePost, DiscoursePostsResponse } from './nodeloc-types.js'
 
@@ -21,7 +22,7 @@ import type { DiscourseTopicDetail, DiscoursePost, DiscoursePostsResponse } from
 const POSTS_BATCH_SIZE = 200
 
 /** 导入结果状态 */
-export type ImportTopicStatus = 'imported' | 'skipped' | 'excluded' | 'missing' | 'empty'
+export type ImportTopicStatus = 'imported' | 'skipped' | 'excluded' | 'missing' | 'empty' | 'filtered'
 
 export interface ImportTopicResult {
   status: ImportTopicStatus
@@ -99,6 +100,16 @@ export async function importTopic(topicId: number): Promise<ImportTopicResult> {
     select: { id: true, localPostId: true },
   })
   if (existing) return { status: 'skipped', localPostId: existing.localPostId ?? undefined }
+
+  // 整楼连坐门禁：标题 / 一楼 / 任一楼层原文命中禁用字眼池 → 整主题作废，不写任何一行。
+  // 放在图片下载/作者归一/写库事务之前，命中即短路，不白白消耗对方 API 与本地 IO。
+  if (
+    containsBannedContent(topic.title) ||
+    containsBannedContent(first.raw) ||
+    posts.some((p) => containsBannedContent(p.raw))
+  ) {
+    return { status: 'filtered' }
+  }
 
   // 图片管道(下载在事务外做,IO 慢且失败可兜底远程 URL)
   const imageCtx = await resolveTopicImages(posts)

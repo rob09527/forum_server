@@ -8,6 +8,7 @@ import { IMPORT_SOURCE, SYNC_POLL_INTERVAL_MS } from './import-config.js'
 import { resolveCategory } from './category-map.js'
 import { resolveTopicImages } from './import-images.js'
 import { cleanMarkdown } from './clean-markdown.js'
+import { containsBannedContent } from './content-filter.js'
 import { resolvePostAuthor, getPlaceholderUser } from './shadow-users.js'
 import { importTopic, buildTags } from './import-topic.js'
 import { importEarn } from './import-points.js'
@@ -451,6 +452,13 @@ async function appendComment(
   assertLock: () => void,
 ): Promise<void> {
   assertLock()
+  // 命中禁用字眼池 → 该条评论整体作废，不落库、不写映射、不计积分。
+  // 主题在导入那一刻已整楼筛过（importTopic 门禁），这里只挡增量新进的单条坏评论。
+  // 放在最前短路，省去后续图片解析/作者归一的网络 IO。
+  if (containsBannedContent(post.raw)) {
+    console.warn(`[import-sync] 新评论命中禁用字眼，跳过(sourcePostId=${post.id}, topicId=${post.topic_id})`)
+    return
+  }
   const authorId = await resolvePostAuthor(post)
   const imageCtx = await resolveTopicImages([post])
   assertLock()
@@ -567,6 +575,16 @@ async function updateSyncedContent(
       where: { id: mappingId, sourceVersion: { lt: toVersion } },
       data: { sourceVersion: toVersion, syncedAt: new Date() },
     })
+    return
+  }
+
+  // 命中禁用字眼池 → 跳过本次编辑，保留旧的干净内容，不把字眼写进库。
+  // 一楼编辑额外看标题（title 也是对外可见的「内容」，严格口径与整楼门禁一致）。
+  if (
+    containsBannedContent(post.raw) ||
+    (target.localPostId && containsBannedContent(post.topic_title))
+  ) {
+    console.warn(`[import-sync] 编辑命中禁用字眼，跳过(sourcePostId=${post.id}, mappingId=${mappingId})`)
     return
   }
 
